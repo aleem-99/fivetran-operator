@@ -10,4 +10,14 @@ plugins:
   scorecard.sdk.operatorframework.io/v2: {}
 projectName: fivetran-operator
 repo: github.com/redhat-data-and-ai/fivetran-operator
+resources:
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: dataverse.redhat.com
+  group: operator
+  kind: FivetranConnector
+  path: github.com/redhat-data-and-ai/fivetran-operator/api/v1alpha1
+  version: v1alpha1
 version: "3"
