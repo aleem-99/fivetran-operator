@@ -1,11 +1,32 @@
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  labels:
-    app.kubernetes.io/name: fivetran-operator
-    app.kubernetes.io/managed-by: kustomize
   name: manager-role
 rules:
-- apiGroups: [""]
-  resources: ["pods"]
-  verbs: ["get", "list", "watch"]
+- apiGroups:
+  - operator.dataverse.redhat.com
+  resources:
+  - fivetranconnectors
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - operator.dataverse.redhat.com
+  resources:
+  - fivetranconnectors/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - operator.dataverse.redhat.com
+  resources:
+  - fivetranconnectors/status
+  verbs:
+  - get
+  - patch
+  - update

@@ -22,6 +22,8 @@ linters:
     - unparam
     - unused
   settings:
+    lll:
+      line-length: 200
     revive:
       rules:
         - name: comment-spacings
