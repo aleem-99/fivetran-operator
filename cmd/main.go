@@ -30,6 +30,7 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/certwatcher"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -38,7 +39,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	operatorv1alpha1 "github.com/redhat-data-and-ai/fivetran-operator/api/v1alpha1"
-	"github.com/redhat-data-and-ai/fivetran-operator/internal/controller"
+	"github.com/redhat-data-and-ai/fivetran-operator/internal/controller/fivetranconnector"
+	"github.com/redhat-data-and-ai/fivetran-operator/pkg/fivetran"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -178,13 +180,26 @@ func main() {
 		})
 	}
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	// Get the namespace to watch from environment variable
+	// WATCH_NAMESPACE is required - the operator will not start without it
+	watchNamespace := os.Getenv("WATCH_NAMESPACE")
+	if watchNamespace == "" {
+		setupLog.Error(nil, "WATCH_NAMESPACE environment variable is required but not set. The operator must be configured to watch a specific namespace.")
+		os.Exit(1)
+	}
+
+	setupLog.Info("Operator is configured to watch a single namespace", "namespace", watchNamespace)
+
+	managerOptions := ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsServerOptions,
 		WebhookServer:          webhookServer,
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "2173ea51.dataverse.redhat.com",
+		Cache: cache.Options{
+			DefaultNamespaces: map[string]cache.Config{watchNamespace: {}},
+		},
 		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
 		// when the Manager ends. This requires the binary to immediately end when the
 		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
@@ -196,19 +211,33 @@ func main() {
 		// if you are doing or is intended to do any operation such as perform cleanups
 		// after the manager stops then its usage might be unsafe.
 		// LeaderElectionReleaseOnCancel: true,
-	})
+	}
+
+	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), managerOptions)
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
 	}
 
-	if err := (&controller.FivetranConnectorReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "FivetranConnector")
+	client, err := fivetran.NewClient(os.Getenv("FIVETRAN_API_KEY"), os.Getenv("FIVETRAN_API_SECRET"))
+	if err != nil {
+		setupLog.Error(err, "FIVETRAN_API_KEY and FIVETRAN_API_SECRET environment variables are required but not set.")
 		os.Exit(1)
 	}
+
+	if client != nil {
+		if err = (&fivetranconnector.FivetranConnectorReconciler{
+			Client:         mgr.GetClient(),
+			Scheme:         mgr.GetScheme(),
+			FivetranClient: client,
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "FivetranConnector")
+			os.Exit(1)
+		}
+	} else {
+		setupLog.Info("Fivetran client not initialized, skipping FivetranConnector controller setup.")
+	}
+
 	// +kubebuilder:scaffold:builder
 
 	if metricsCertWatcher != nil {

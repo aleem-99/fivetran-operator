@@ -6,4 +6,19 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: fivetranconnector-sample
 spec:
-  # TODO(user): Add fields here
+  connector:
+    group_id: "<destination_group_id>"
+    service: fivetran_log
+    paused: true
+    daily_sync_time: "21:00"
+    sync_frequency: 1440
+    schedule_type: manual
+    pause_after_trial: false
+    config:
+      is_account_level_connector: false
+      schema: <destination_schema>
+  # connectorSchemas:
+  #   schema_change_handling: ALLOW_ALL
+  #   schemas:
+  #     <schema>:
+  #       enabled: true

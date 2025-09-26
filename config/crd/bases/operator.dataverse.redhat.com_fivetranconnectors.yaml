@@ -1,0 +1,330 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.18.0
+  name: fivetranconnectors.operator.dataverse.redhat.com
+spec:
+  group: operator.dataverse.redhat.com
+  names:
+    kind: FivetranConnector
+    listKind: FivetranConnectorList
+    plural: fivetranconnectors
+    singular: fivetranconnector
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.conditions[?(@.type=="ConnectorReady")].status
+      name: Connector
+      type: string
+    - jsonPath: .status.connectorUrl
+      name: ConnectorURL
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="SetupTestReady")].status
+      name: SetupTests
+      priority: 1
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="SchemaReady")].status
+      name: Schema
+      priority: 1
+      type: string
+    - jsonPath: .status.connectorId
+      name: ConnectorID
+      priority: 1
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: FivetranConnector is the Schema for the fivetranconnectors API.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: FivetranConnectorSpec defines the desired state of FivetranConnector.
+            properties:
+              connector:
+                properties:
+                  auth:
+                    description: The connector authorization parameters
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                  config:
+                    description: The connector configuration parameters
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                  daily_sync_time:
+                    description: |-
+                      Sync settings
+                      The optional parameter that defines the sync start time when the sync frequency is already set or being set by the current request to 1440.
+                    pattern: ^([0-1]?[0-9]|2[0-3]):00$
+                    type: string
+                  data_delay_sensitivity:
+                    description: |-
+                      Data delay sensitivity
+                      The level of data delay notification threshold.
+                    enum:
+                    - LOW
+                    - NORMAL
+                    - HIGH
+                    - CUSTOM
+                    - SYNC_FREQUENCY
+                    type: string
+                  data_delay_threshold:
+                    description: Custom sync delay notification threshold in minutes.
+                    type: integer
+                  group_id:
+                    description: The unique identifier for the group within the Fivetran
+                      system
+                    type: string
+                    x-kubernetes-validations:
+                    - message: field is immutable
+                      rule: self == oldSelf
+                  hybrid_deployment_agent_id:
+                    description: The unique identifier for the hybrid deployment agent
+                      within the Fivetran system.
+                    type: string
+                  networking_method:
+                    description: Networking
+                    enum:
+                    - Directly
+                    - PrivateLink
+                    - SshTunnel
+                    - ProxyAgent
+                    type: string
+                  pause_after_trial:
+                    default: false
+                    description: Specifies whether the connection should be paused
+                      after the free trial period has ended
+                    type: boolean
+                  paused:
+                    default: false
+                    description: |-
+                      State settings
+                      Specifies whether the connection is paused
+                    type: boolean
+                  private_link_id:
+                    description: The unique identifier for the self-served private
+                      link that is used by the connection
+                    type: string
+                  proxy_agent_id:
+                    description: The unique identifier for the proxy agent within
+                      the Fivetran system
+                    type: string
+                  run_setup_tests:
+                    default: true
+                    description: Specifies whether the setup tests should be run automatically.
+                      The default value is TRUE.
+                    type: boolean
+                  schedule_type:
+                    description: 'The connection schedule configuration type. Supported
+                      values: auto, manual'
+                    enum:
+                    - auto
+                    - manual
+                    type: string
+                  service:
+                    description: The connector name within the Fivetran system
+                    type: string
+                    x-kubernetes-validations:
+                    - message: field is immutable
+                      rule: self == oldSelf
+                  sync_frequency:
+                    description: The connection sync frequency in minutes
+                    enum:
+                    - 1
+                    - 5
+                    - 15
+                    - 30
+                    - 60
+                    - 120
+                    - 180
+                    - 360
+                    - 480
+                    - 720
+                    - 1440
+                    type: integer
+                  trust_certificates:
+                    default: true
+                    description: |-
+                      Trust settings
+                      Specifies whether we should trust the certificate automatically. The default value is TRUE.
+                    type: boolean
+                  trust_fingerprints:
+                    default: true
+                    description: Specifies whether we should trust the SSH fingerprint
+                      automatically. The default value is TRUE.
+                    type: boolean
+                required:
+                - config
+                - group_id
+                - paused
+                - service
+                type: object
+                x-kubernetes-validations:
+                - message: daily_sync_time can only be specified when sync_frequency
+                    is 1440
+                  rule: '!(has(self.daily_sync_time) && self.daily_sync_time != '''')
+                    || self.sync_frequency == 1440'
+              connectorSchemas:
+                description: |-
+                  Schema-related types
+                  SchemaConfig represents a Fivetran schema configuration
+                properties:
+                  schema_change_handling:
+                    description: The schema change handling policy. ALLOW_ALL includes
+                      all new schemas, tables, and columns. ALLOW_COLUMNS excludes
+                      new schemas and tables but includes new columns. BLOCK_ALL excludes
+                      all new schemas, tables, and columns.
+                    enum:
+                    - ALLOW_ALL
+                    - ALLOW_COLUMNS
+                    - BLOCK_ALL
+                    type: string
+                  schemas:
+                    additionalProperties:
+                      description: SchemaObject represents a schema within the connector
+                      properties:
+                        enabled:
+                          type: boolean
+                        tables:
+                          additionalProperties:
+                            description: TableObject represents a table within a schema
+                            properties:
+                              columns:
+                                additionalProperties:
+                                  description: ColumnObject represents a column within
+                                    a table
+                                  properties:
+                                    enabled:
+                                      type: boolean
+                                    hashed:
+                                      type: boolean
+                                    is_primary_key:
+                                      type: boolean
+                                    masking_algorithm:
+                                      description: The masking algorithm to apply
+                                        to the column data. PLAINTEXT stores data
+                                        as-is, HASHED applies hashing, ENCRYPTED applies
+                                        encryption.
+                                      enum:
+                                      - PLAINTEXT
+                                      - HASHED
+                                      - ENCRYPTED
+                                      type: string
+                                  required:
+                                  - enabled
+                                  - hashed
+                                  - is_primary_key
+                                  type: object
+                                type: object
+                              enabled:
+                                type: boolean
+                              sync_mode:
+                                description: The sync mode for the table. SOFT_DELETE
+                                  preserves deleted records, HISTORY maintains change
+                                  history, LIVE provides real-time data.
+                                enum:
+                                - SOFT_DELETE
+                                - HISTORY
+                                - LIVE
+                                type: string
+                            required:
+                            - enabled
+                            type: object
+                          type: object
+                      required:
+                      - enabled
+                      type: object
+                    type: object
+                type: object
+            required:
+            - connector
+            type: object
+          status:
+            description: FivetranConnectorStatus defines the observed state of FivetranConnector
+            properties:
+              conditions:
+                description: Conditions represent the underlying resource state
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              connectorId:
+                description: ConnectorID is the ID of the created Fivetran connector
+                type: string
+              connectorUrl:
+                description: ConnectorURL is the URL of the created Fivetran connector
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

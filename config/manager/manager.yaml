@@ -65,6 +65,21 @@ spec:
           - --health-probe-bind-address=:8081
         image: controller:latest
         name: manager
+        env:
+        - name: WATCH_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: FIVETRAN_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: fivetran-secrets
+              key: FIVETRAN_API_KEY
+        - name: FIVETRAN_API_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: fivetran-secrets
+              key: FIVETRAN_API_SECRET
         ports: []
         securityContext:
           allowPrivilegeEscalation: false
@@ -88,11 +103,12 @@ spec:
         resources:
           limits:
             cpu: 500m
-            memory: 128Mi
+            memory: 512Mi
           requests:
-            cpu: 10m
-            memory: 64Mi
+            cpu: 500m
+            memory: 512Mi
         volumeMounts: []
+        imagePullPolicy: Always
       volumes: []
       serviceAccountName: controller-manager
       terminationGracePeriodSeconds: 10

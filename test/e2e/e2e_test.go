@@ -31,7 +31,7 @@ import (
 )
 
 // namespace where the project is deployed in
-const namespace = "fivetran-operator-system"
+const namespace = "fivetran-operator"
 
 // serviceAccountName created for the project
 const serviceAccountName = "fivetran-operator-controller-manager"
