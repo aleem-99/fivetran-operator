@@ -44,6 +44,10 @@ func (r *FivetranConnectorReconciler) handleError(ctx context.Context, connector
 
 	// Check if the error is a setup test error (should not requeue)
 	if errors.Is(err, ErrSetupTestsFailed) {
+		// Set connector ready condition to true because setup tests failed after connector reconciliation was successful
+		if err := r.setCondition(ctx, connector, conditionTypeConnectorReady, metav1.ConditionTrue, ConnectorReasonSuccess, msgConnectorReady); err != nil {
+			return ctrl.Result{}, err
+		}
 		return ctrl.Result{}, r.setCondition(ctx, connector, conditionType, metav1.ConditionFalse, reason, err.Error())
 	}
 
@@ -73,33 +77,6 @@ func (r *FivetranConnectorReconciler) handleError(ctx context.Context, connector
 	return ctrl.Result{}, err
 }
 
-// updateFinalStatus sets the final status conditions for successful reconciliation
-func (r *FivetranConnectorReconciler) updateFinalStatus(ctx context.Context, connector *operatorv1alpha1.FivetranConnector, reconciledConnector, reconciledSchema bool, setupTestWarnings []string) error {
-	logger := log.FromContext(ctx)
-	logger.Info("Updating final status conditions", "reconciledConnector", reconciledConnector, "reconciledSchema", reconciledSchema)
-
-	// Update connector condition
-	if reconciledConnector {
-		if err := r.setCondition(ctx, connector, conditionTypeConnectorReady, metav1.ConditionTrue, ConnectorReasonSuccess, msgConnectorReady); err != nil {
-			return err
-		}
-	}
-
-	// Update setup tests condition
-	if reconciledConnector {
-		if err := r.updateSetupTestsCondition(ctx, connector, setupTestWarnings); err != nil {
-			return err
-		}
-	}
-
-	// Update schema condition
-	if err := r.updateSchemaCondition(ctx, connector, reconciledSchema); err != nil {
-		return err
-	}
-
-	return nil
-}
-
 // updateSetupTestsCondition handles the setup tests condition logic
 func (r *FivetranConnectorReconciler) updateSetupTestsCondition(ctx context.Context, connector *operatorv1alpha1.FivetranConnector, setupTestWarnings []string) error {
 	// Check if setup tests are enabled (default to true if nil)
@@ -119,21 +96,6 @@ func (r *FivetranConnectorReconciler) updateSetupTestsCondition(ctx context.Cont
 	}
 
 	return r.setCondition(ctx, connector, conditionTypeSetupTestReady, metav1.ConditionTrue, reason, message)
-}
-
-// updateSchemaCondition handles the schema condition logic
-func (r *FivetranConnectorReconciler) updateSchemaCondition(ctx context.Context, connector *operatorv1alpha1.FivetranConnector, reconciledSchema bool) error {
-	hasSchema := r.hasSchemaConfig(connector)
-
-	if reconciledSchema && hasSchema {
-		return r.setCondition(ctx, connector, conditionTypeSchemaReady, metav1.ConditionTrue, SchemaReasonReconciliationSuccess, msgSchemaReady)
-	}
-
-	if !hasSchema {
-		return r.setCondition(ctx, connector, conditionTypeSchemaReady, metav1.ConditionTrue, SchemaReasonSkipped, msgSchemaSkipped)
-	}
-
-	return nil
 }
 
 // setCondition sets a condition on the connector

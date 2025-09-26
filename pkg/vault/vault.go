@@ -27,12 +27,12 @@ func NewClient(cfg *ClientConfig) (*vault.Client, error) {
 		&auth.SecretID{FromString: cfg.SecretID},
 	)
 	if err != nil {
-		return nil, fmt.Errorf("unable to initialize AppRole auth method: %w", err)
+		return nil, err
 	}
 
 	authInfo, err := vaultClient.Auth().Login(context.Background(), appRoleAuth)
 	if err != nil {
-		return nil, fmt.Errorf("unable to login to AppRole auth method: %w", err)
+		return nil, err
 	}
 	if authInfo == nil {
 		return nil, fmt.Errorf("no auth info was returned after login")
@@ -103,10 +103,7 @@ func NewClientConfig(address, roleID, secretID, mountPath string) (*ClientConfig
 func InitializeVaultClientFromSecret(ctx context.Context, k8sClient client.Client, namespace, secretName string) (*VaultClient, error) {
 	vaultSecret := &corev1.Secret{}
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: secretName}, vaultSecret); err != nil {
-		if client.IgnoreNotFound(err) == nil {
-			return nil, fmt.Errorf("vault secret not found: %s", secretName)
-		}
-		return nil, fmt.Errorf("failed to get vault secret %s: %w", secretName, err)
+		return nil, err
 	}
 
 	vaultConfig, err := NewClientConfig(
@@ -116,12 +113,12 @@ func InitializeVaultClientFromSecret(ctx context.Context, k8sClient client.Clien
 		string(vaultSecret.Data["mountPath"]),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create vault config: %w", err)
+		return nil, err
 	}
 
 	vaultClient, err := NewClient(vaultConfig)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create vault client: %w", err)
+		return nil, err
 	}
 
 	return &VaultClient{

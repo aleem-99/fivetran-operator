@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -48,6 +49,9 @@ func (r *FivetranConnectorReconciler) reconcileConnector(ctx context.Context, co
 		if err := r.updateConnectorHash(ctx, connector); err != nil {
 			return "", err
 		}
+		if err := r.setCondition(ctx, connector, conditionTypeConnectorReady, metav1.ConditionTrue, ConnectorReasonSuccess, msgConnectorReady); err != nil {
+			return "", err
+		}
 		logger.Info("Connector created successfully", "connectorId", connectorID)
 	} else {
 		// Update existing connector
@@ -59,6 +63,9 @@ func (r *FivetranConnectorReconciler) reconcileConnector(ctx context.Context, co
 			return "", err
 		}
 		if updated {
+			if err := r.setCondition(ctx, connector, conditionTypeConnectorReady, metav1.ConditionTrue, ConnectorReasonSuccess, msgConnectorReady); err != nil {
+				return "", err
+			}
 			logger.Info("Connector updated successfully", "connectorId", connectorID)
 		}
 	}
@@ -125,7 +132,6 @@ func (r *FivetranConnectorReconciler) handleExistingConnectorAdoption(ctx contex
 			connector.Spec.Connector.GroupID, existingConnector.Data.GroupID)
 	}
 
-	// Validate schema
 	// Validate schema configuration when adopting an existing connector
 	// This ensures the Kubernetes resource configuration matches the actual Fivetran connector schema
 	if connector.Spec.Connector.Config != nil {

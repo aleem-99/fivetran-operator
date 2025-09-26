@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	operatorv1alpha1 "github.com/redhat-data-and-ai/fivetran-operator/api/v1alpha1"
@@ -65,8 +66,8 @@ func (r *FivetranConnectorReconciler) reconcileSchema(ctx context.Context, conne
 			"connectorId", connectorID,
 			"mismatches", mismatchDetails.String())
 
-		// Reload schema and apply again
-		logger.Info("Reloading schema again")
+		// Reload schema and apply
+		logger.Info("Reloading schema")
 		if err := r.reloadSchema(ctx, connector, connectorID); err != nil {
 			return fmt.Errorf("reconcileSchema reloadSchema retry: %w", err)
 		}
@@ -85,11 +86,12 @@ func (r *FivetranConnectorReconciler) reconcileSchema(ctx context.Context, conne
 		if !retryMatches {
 			return fmt.Errorf("reconcileSchema compareSchemaWithCR retry: mismatches: %s - %w", retryMismatchDetails.String(), ErrSchemaMismatchAfterRetry)
 		}
-
-		logger.Info("Schema configuration applied successfully after retry", "connectorId", connectorID)
-	} else {
-		logger.Info("Schema configuration applied successfully", "connectorId", connectorID)
 	}
+
+	if err := r.setCondition(ctx, connector, conditionTypeSchemaReady, metav1.ConditionTrue, SchemaReasonReconciliationSuccess, msgSchemaReady); err != nil {
+		return err
+	}
+	logger.Info("Schema configuration applied successfully", "connectorId", connectorID)
 
 	return nil
 }

@@ -68,10 +68,10 @@ const (
 	// Status messages
 	msgConnectorReady                  = "Connector is ready"
 	msgSetupTestsCompletedSuccessfully = "Setup tests completed successfully"
+	msgSetupTestsWarningsFormat        = "Setup tests completed with warnings: %s"
 	msgSetupTestsSkipped               = "Setup tests skipped"
 	msgSchemaReady                     = "Schema configuration is ready"
 	msgSchemaSkipped                   = "No schema configuration specified"
-	msgSetupTestsWarningsFormat        = "Setup tests completed with warnings: %s"
 )
 
 var (

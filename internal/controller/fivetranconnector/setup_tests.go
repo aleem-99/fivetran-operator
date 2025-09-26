@@ -31,12 +31,17 @@ func (r *FivetranConnectorReconciler) reconcileSetupTests(ctx context.Context, c
 	logger := log.FromContext(ctx)
 	logger.Info("Reconciling setup tests")
 	// Check if tests are requested (default to true if nil)
+	var setupTestErrors []error
+	var warningMessages []string
 	runTests := true
 	if connector.Spec.Connector.RunSetupTests != nil {
 		runTests = *connector.Spec.Connector.RunSetupTests
 	}
 
 	if !runTests {
+		if err := r.updateSetupTestsCondition(ctx, connector, warningMessages); err != nil {
+			return warningMessages, err
+		}
 		logger.Info("skipping setup tests", "connectorId", connectorID)
 		return nil, nil
 	}
@@ -49,8 +54,7 @@ func (r *FivetranConnectorReconciler) reconcileSetupTests(ctx context.Context, c
 	}
 
 	// Check test results
-	var setupTestErrors []error
-	var warningMessages []string
+
 	for _, test := range resp.Data.SetupTests {
 		// Only PASSED, SKIPPED, and WARNING are considered successful
 		// FAILED and JOB_FAILED should be treated as failures
@@ -68,8 +72,14 @@ func (r *FivetranConnectorReconciler) reconcileSetupTests(ctx context.Context, c
 
 	// Return warning messages (if any) and no error
 	if len(warningMessages) > 0 {
+		if err := r.updateSetupTestsCondition(ctx, connector, warningMessages); err != nil {
+			return warningMessages, err
+		}
 		logger.Info("Setup tests completed with warnings", "connectorId", connectorID, "warnings", warningMessages)
 	} else {
+		if err := r.updateSetupTestsCondition(ctx, connector, warningMessages); err != nil {
+			return warningMessages, err
+		}
 		logger.Info("Setup tests completed successfully", "connectorId", connectorID)
 	}
 

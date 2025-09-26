@@ -36,10 +36,6 @@ func (e *VaultError) Error() string {
 	return e.Err.Error()
 }
 
-func (e *VaultError) Unwrap() error {
-	return e.Err
-}
-
 func (e *VaultError) IsRetryable() bool {
 	return e.Retryable
 }

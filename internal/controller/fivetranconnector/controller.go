@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -149,6 +150,10 @@ func (r *FivetranConnectorReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		if err := r.reconcileSchema(ctx, connector, connectorID); err != nil {
 			return r.handleError(ctx, connector, conditionTypeSchemaReady, SchemaReasonReconciliationFailed, err)
 		}
+	} else {
+		if err := r.setCondition(ctx, connector, conditionTypeSchemaReady, metav1.ConditionTrue, SchemaReasonSkipped, msgSchemaSkipped); err != nil {
+			return r.handleError(ctx, connector, conditionTypeSchemaReady, SchemaReasonSkipped, err)
+		}
 	}
 
 	// Update connector again to set ScheduleType and pause state
@@ -159,12 +164,6 @@ func (r *FivetranConnectorReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		if err != nil {
 			return r.handleError(ctx, connector, conditionTypeConnectorReady, ConnectorReasonReconciliationFailed, err)
 		}
-	}
-
-	// Set final status conditions
-	err = r.updateFinalStatus(ctx, connector, reconcileConnector, reconcileSchema, setupTestWarnings)
-	if err != nil {
-		return r.handleError(ctx, connector, conditionTypeConnectorReady, ConnectorReasonReconciliationFailed, err)
 	}
 
 	// Clean up annotations and labels

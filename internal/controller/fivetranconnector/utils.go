@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -168,7 +169,7 @@ func (*FivetranConnectorReconciler) hasFailedConditions(connector *operatorv1alp
 	}
 
 	for _, condition := range connector.Status.Conditions {
-		if condition.Status == "False" {
+		if condition.Status == metav1.ConditionFalse {
 			return true
 		}
 	}

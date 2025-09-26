@@ -97,7 +97,6 @@ func extractCommonResponse(response any) (*common.CommonResponse, bool) {
 	}
 
 	// Handle structs that embed CommonResponse
-	// Use reflection to check if the response has a CommonResponse field
 	if respBytes, err := json.Marshal(response); err == nil {
 		var commonResp common.CommonResponse
 		if err := json.Unmarshal(respBytes, &commonResp); err == nil {

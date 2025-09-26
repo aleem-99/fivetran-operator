@@ -26,12 +26,10 @@ func (s *schemaServiceImpl) CreateSchema(ctx context.Context, ConnectionID strin
 	schemaService := s.client.NewConnectionSchemaCreateService()
 	service := schemaService.ConnectionID(ConnectionID)
 
-	// Only set SchemaChangeHandling if it's provided
 	if schemaChangeHandling != "" {
 		service = service.SchemaChangeHandling(schemaChangeHandling)
 	}
 
-	// Only add schemas if they exist
 	for schemaName, schema := range schemas {
 		service = service.Schema(schemaName, schema)
 	}
@@ -51,12 +49,10 @@ func (s *schemaServiceImpl) UpdateSchema(ctx context.Context, ConnectionID strin
 	schemaService := s.client.NewConnectionSchemaUpdateService()
 	service := schemaService.ConnectionID(ConnectionID)
 
-	// Only set SchemaChangeHandling if it's provided
 	if schemaChangeHandling != "" {
 		service = service.SchemaChangeHandling(schemaChangeHandling)
 	}
 
-	// Only add schemas if they exist
 	for schemaName, schema := range schemas {
 		service = service.Schema(schemaName, schema)
 	}
