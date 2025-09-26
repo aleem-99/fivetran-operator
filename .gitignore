@@ -27,6 +27,7 @@ go.work
 *~
 .venv/
 config/myconfigs/*
+dist/*
 
 # Any certificate files
 *.key
