@@ -398,7 +398,7 @@ func TestInitializeVaultClientFromSecret(t *testing.T) {
 			namespace:   "test-namespace",
 			objects:     []client.Object{},
 			expectError: true,
-			errorMsg:    "vault secret not found: nonexistent-secret",
+			errorMsg:    "secrets \"nonexistent-secret\" not found",
 		},
 		{
 			name:        "incomplete secret data",
@@ -406,7 +406,7 @@ func TestInitializeVaultClientFromSecret(t *testing.T) {
 			namespace:   "test-namespace",
 			objects:     []client.Object{incompleteSecret},
 			expectError: true,
-			errorMsg:    "failed to create vault config: vault secretID is required",
+			errorMsg:    "vault secretID is required",
 		},
 	}
 
