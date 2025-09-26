@@ -7,7 +7,6 @@ import (
 	"bufio"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -17,9 +16,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hashicorp/errwrap"
 	"github.com/hashicorp/go-uuid"
 	"github.com/hashicorp/vault/helper/namespace"
-	"github.com/hashicorp/vault/limits"
 	"github.com/hashicorp/vault/sdk/helper/consts"
 	"github.com/hashicorp/vault/sdk/logical"
 	"github.com/hashicorp/vault/vault"
@@ -51,8 +50,7 @@ func buildLogicalRequestNoAuth(perfStandby bool, ra *vault.RouterAccess, w http.
 	if err != nil {
 		return nil, nil, http.StatusBadRequest, nil
 	}
-	path := ns.TrimmedPath(r.URL.Path[len("/v1/"):])
-
+	path := trimPath(ns, r.URL.Path)
 	var data map[string]interface{}
 	var origBody io.ReadCloser
 	var passHTTPReq bool
@@ -113,7 +111,10 @@ func buildLogicalRequestNoAuth(perfStandby bool, ra *vault.RouterAccess, w http.
 		contentType := r.Header.Get("Content-Type")
 
 		if (ra != nil && ra.IsBinaryPath(r.Context(), path)) ||
-			path == "sys/storage/raft/snapshot" || path == "sys/storage/raft/snapshot-force" {
+			path == "sys/storage/raft/snapshot" ||
+			path == "sys/storage/raft/snapshot-force" ||
+			path == "sys/storage/raft/snapshot-load" {
+
 			passHTTPReq = true
 			origBody = r.Body
 		} else {
@@ -146,7 +147,7 @@ func buildLogicalRequestNoAuth(perfStandby bool, ra *vault.RouterAccess, w http.
 				if err != nil {
 					status := http.StatusBadRequest
 					logical.AdjustErrorStatusCode(&status, err)
-					return nil, nil, status, fmt.Errorf("error parsing JSON")
+					return nil, nil, status, fmt.Errorf("error parsing JSON: %w", err)
 				}
 			}
 		}
@@ -204,13 +205,38 @@ func buildLogicalRequestNoAuth(perfStandby bool, ra *vault.RouterAccess, w http.
 		return nil, nil, http.StatusInternalServerError, fmt.Errorf("failed to generate identifier for the request: %w", err)
 	}
 
+	var requiredSnapshotID string
+
+	// check for a read, list, or recover from snapshot request
+	switch op {
+	case logical.ReadOperation, logical.ListOperation:
+		snapshotID, ok := data[VaultSnapshotReadParam]
+		if ok && snapshotID != "" {
+			requiredSnapshotID = snapshotID.(string)
+			delete(data, VaultSnapshotReadParam)
+			if len(data) == 0 {
+				data = nil
+			}
+		}
+	case logical.UpdateOperation:
+		queryVals := r.URL.Query()
+		if queryVals.Has(VaultSnapshotRecoverParam) {
+			snapshotID := queryVals.Get(VaultSnapshotRecoverParam)
+			if snapshotID != "" {
+				requiredSnapshotID = snapshotID
+				op = logical.RecoverOperation
+			}
+		}
+	}
+
 	req := &logical.Request{
-		ID:         requestId,
-		Operation:  op,
-		Path:       path,
-		Data:       data,
-		Connection: getConnection(r),
-		Headers:    r.Header,
+		ID:                 requestId,
+		Operation:          op,
+		Path:               path,
+		Data:               data,
+		Connection:         getConnection(r),
+		Headers:            r.Header,
+		RequiresSnapshotID: requiredSnapshotID,
 	}
 
 	if ra != nil && ra.IsLimitedPath(r.Context(), path) {
@@ -362,11 +388,13 @@ func handleLogicalInternal(core *vault.Core, injectDataIntoTopLevel bool, noForw
 			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
+		trimmedPath := trimPath(ns, r.URL.Path)
+
 		nsPath := ns.Path
 		if ns.ID == namespace.RootNamespaceID {
 			nsPath = ""
 		}
-		if strings.HasPrefix(r.URL.Path, fmt.Sprintf("/v1/%ssys/events/subscribe/", nsPath)) {
+		if websocketPaths.HasPath(trimmedPath) {
 			handler := entHandleEventsSubscribe(core, req)
 			if handler != nil {
 				handler.ServeHTTP(w, r)
@@ -386,8 +414,8 @@ func handleLogicalInternal(core *vault.Core, injectDataIntoTopLevel bool, noForw
 		// success.
 		resp, ok, needsForward := request(core, w, r, req)
 		switch {
-		case errors.Is(resp.Error(), limits.ErrCapacity):
-			respondError(w, http.StatusServiceUnavailable, limits.ErrCapacity)
+		case errwrap.Contains(resp.Error(), consts.ErrOverloaded.Error()):
+			respondError(w, http.StatusServiceUnavailable, consts.ErrOverloaded)
 			return
 		case needsForward && noForward:
 			respondError(w, http.StatusBadRequest, vault.ErrCannotForwardLocalOnly)
@@ -473,6 +501,8 @@ func respondLogical(core *vault.Core, w http.ResponseWriter, r *http.Request, re
 // returning the CRL information on the PKI backends.
 func respondRaw(w http.ResponseWriter, r *http.Request, resp *logical.Response) {
 	retErr := func(w http.ResponseWriter, err string) {
+		defer logical.IncrementResponseStatusCodeMetric(http.StatusInternalServerError)
+
 		w.Header().Set("X-Vault-Raw-Error", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		w.Write(nil)
@@ -573,6 +603,8 @@ WRITE_RESPONSE:
 
 	w.WriteHeader(status)
 	w.Write(body)
+
+	logical.IncrementResponseStatusCodeMetric(status)
 }
 
 // getConnection is used to format the connection information for

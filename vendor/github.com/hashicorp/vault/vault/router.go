@@ -60,16 +60,20 @@ func NewRouter() *Router {
 
 // routeEntry is used to represent a mount point in the router
 type routeEntry struct {
-	tainted       atomic.Bool
-	backend       logical.Backend
-	mountEntry    *MountEntry
-	storageView   logical.Storage
-	storagePrefix string
-	rootPaths     atomic.Value
-	loginPaths    atomic.Value
-	binaryPaths   atomic.Value
-	limitedPaths  atomic.Value
-	l             sync.RWMutex
+	tainted atomic.Bool
+	// backend is the actual backend instance for this route entry; lock l must
+	// be held to access this field.
+	backend                logical.Backend
+	mountEntry             *MountEntry
+	storageView            logical.Storage
+	storagePrefix          string
+	rootPaths              atomic.Value
+	loginPaths             atomic.Value
+	binaryPaths            atomic.Value
+	limitedPaths           atomic.Value
+	allowSnapshotReadPaths atomic.Value
+	// l is the lock used to protect access to backend during reloads
+	l sync.RWMutex
 }
 
 type wildcardPath struct {
@@ -86,7 +90,8 @@ type specialPathsEntry struct {
 }
 
 // specialPathsLookupFunc is used by (*Router).specialPath to look up a
-// specialPathsEntry corresponding to loginPath, binaryPath, or limitedPath.
+// specialPathsEntry corresponding to loginPath, binaryPath, limitedPath, or
+// allowSnapshotReadPath.
 type specialPathsLookupFunc func(re *routeEntry) *specialPathsEntry
 
 type ValidateMountResponse struct {
@@ -221,6 +226,12 @@ func (r *Router) Mount(backend logical.Backend, prefix string, mountEntry *Mount
 		return err
 	}
 	re.limitedPaths.Store(limitedPathsEntry)
+
+	allowSnapshotReadPathsEntry, err := parseUnauthenticatedPaths(paths.AllowSnapshotRead)
+	if err != nil {
+		return err
+	}
+	re.allowSnapshotReadPaths.Store(allowSnapshotReadPathsEntry)
 
 	switch {
 	case prefix == "":
@@ -370,23 +381,30 @@ func (r *Router) MatchingMountByAccessor(mountAccessor string) *MountEntry {
 // MatchingMount returns the mount prefix that would be used for a path
 func (r *Router) MatchingMount(ctx context.Context, path string) string {
 	r.l.RLock()
-	mount := r.matchingMountInternal(ctx, path)
+	mount, _ := r.matchingMountInternal(ctx, path)
 	r.l.RUnlock()
 	return mount
 }
 
-func (r *Router) matchingMountInternal(ctx context.Context, path string) string {
+// MatchingMountAndEntry returns the mount prefix and MountEntry used for a path
+func (r *Router) MatchingMountAndEntry(ctx context.Context, path string) (string, *MountEntry) {
+	r.l.RLock()
+	defer r.l.RUnlock()
+	return r.matchingMountInternal(ctx, path)
+}
+
+func (r *Router) matchingMountInternal(ctx context.Context, path string) (string, *MountEntry) {
 	ns, err := namespace.FromContext(ctx)
 	if err != nil {
-		return ""
+		return "", nil
 	}
 	path = ns.Path + path
 
-	mount, _, ok := r.root.LongestPrefix(path)
+	mount, raw, ok := r.root.LongestPrefix(path)
 	if !ok {
-		return ""
+		return "", nil
 	}
-	return mount
+	return mount, raw.(*routeEntry).mountEntry
 }
 
 // matchingPrefixInternal returns a mount prefix that a path may be a part of
@@ -413,7 +431,7 @@ func (r *Router) matchingPrefixInternal(ctx context.Context, path string) string
 func (r *Router) MountConflict(ctx context.Context, path string) string {
 	r.l.RLock()
 	defer r.l.RUnlock()
-	if exactMatch := r.matchingMountInternal(ctx, path); exactMatch != "" {
+	if exactMatch, _ := r.matchingMountInternal(ctx, path); exactMatch != "" {
 		return exactMatch
 	}
 	if prefixMatch := r.matchingPrefixInternal(ctx, path); prefixMatch != "" {
@@ -456,26 +474,20 @@ func (r *Router) matchingStorage(ctx context.Context, path string, apiPath bool)
 
 // MatchingMountEntry returns the MountEntry used for a path
 func (r *Router) MatchingMountEntry(ctx context.Context, path string) *MountEntry {
-	ns, err := namespace.FromContext(ctx)
-	if err != nil {
-		return nil
-	}
-	path = ns.Path + path
-
-	r.l.RLock()
-	_, raw, ok := r.root.LongestPrefix(path)
-	r.l.RUnlock()
-	if !ok {
-		return nil
-	}
-	return raw.(*routeEntry).mountEntry
+	_, mountEntry := r.MatchingBackendAndMountEntry(ctx, path)
+	return mountEntry
 }
 
 // MatchingBackend returns the backend used for a path
 func (r *Router) MatchingBackend(ctx context.Context, path string) logical.Backend {
+	be, _ := r.MatchingBackendAndMountEntry(ctx, path)
+	return be
+}
+
+func (r *Router) MatchingBackendAndMountEntry(ctx context.Context, path string) (logical.Backend, *MountEntry) {
 	ns, err := namespace.FromContext(ctx)
 	if err != nil {
-		return nil
+		return nil, nil
 	}
 	path = ns.Path + path
 
@@ -483,39 +495,24 @@ func (r *Router) MatchingBackend(ctx context.Context, path string) logical.Backe
 	_, raw, ok := r.root.LongestPrefix(path)
 	r.l.RUnlock()
 	if !ok {
-		return nil
+		return nil, nil
 	}
 
 	re := raw.(*routeEntry)
+
 	re.l.RLock()
 	defer re.l.RUnlock()
 
-	return re.backend
+	return re.backend, re.mountEntry
 }
 
 // MatchingSystemView returns the SystemView used for a path
 func (r *Router) MatchingSystemView(ctx context.Context, path string) logical.SystemView {
-	ns, err := namespace.FromContext(ctx)
-	if err != nil {
+	backend := r.MatchingBackend(ctx, path)
+	if backend == nil {
 		return nil
 	}
-	path = ns.Path + path
-
-	r.l.RLock()
-	_, raw, ok := r.root.LongestPrefix(path)
-	r.l.RUnlock()
-	if !ok || raw.(*routeEntry).backend == nil {
-		return nil
-	}
-	return raw.(*routeEntry).backend.System()
-}
-
-func (r *Router) MatchingMountByAPIPath(ctx context.Context, path string) string {
-	me, _, _ := r.matchingMountEntryByPath(ctx, path, true)
-	if me == nil {
-		return ""
-	}
-	return me.Path
+	return backend.System()
 }
 
 // MatchingStoragePrefixByAPIPath the storage prefix for the given api path
@@ -526,13 +523,13 @@ func (r *Router) MatchingStoragePrefixByAPIPath(ctx context.Context, path string
 	}
 	path = ns.Path + path
 
-	_, prefix, found := r.matchingMountEntryByPath(ctx, path, true)
+	_, prefix, found := r.matchingMountEntryByPath(path, true)
 	return prefix, found
 }
 
 // MatchingAPIPrefixByStoragePath the api path information for the given storage path
 func (r *Router) MatchingAPIPrefixByStoragePath(ctx context.Context, path string) (*namespace.Namespace, string, string, bool) {
-	me, prefix, found := r.matchingMountEntryByPath(ctx, path, false)
+	me, prefix, found := r.matchingMountEntryByPath(path, false)
 	if !found {
 		return nil, "", "", found
 	}
@@ -546,7 +543,7 @@ func (r *Router) MatchingAPIPrefixByStoragePath(ctx context.Context, path string
 	return me.Namespace(), mountPath, prefix, found
 }
 
-func (r *Router) matchingMountEntryByPath(ctx context.Context, path string, apiPath bool) (*MountEntry, string, bool) {
+func (r *Router) matchingMountEntryByPath(path string, apiPath bool) (*MountEntry, string, bool) {
 	var raw interface{}
 	var ok bool
 	r.l.RLock()
@@ -921,9 +918,18 @@ func (r *Router) LimitedPath(ctx context.Context, path string) bool {
 		})
 }
 
+// AllowSnapshotReadPath checks if the given path is allowed to be used for a
+// snapshot read
+func (r *Router) AllowSnapshotReadPath(ctx context.Context, path string) bool {
+	return r.specialPath(ctx, path,
+		func(re *routeEntry) *specialPathsEntry {
+			return re.allowSnapshotReadPaths.Load().(*specialPathsEntry)
+		})
+}
+
 // specialPath is a common method for checking if the given path has a matching
-// PathsSpecial entry. This is used for Login, Binary, and Limited PathsSpecial
-// fields.
+// PathsSpecial entry. This is used for Login, Binary, Limited, and
+// AllowSnapshotRead PathsSpecial fields.
 // Matching Priority
 //  1. prefix
 //  2. exact

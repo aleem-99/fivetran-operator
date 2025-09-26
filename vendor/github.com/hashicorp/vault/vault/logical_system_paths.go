@@ -1180,6 +1180,10 @@ func (b *SystemBackend) rekeyPaths() []*framework.Path {
 					Type:        framework.TypeBool,
 					Description: "Specifies if previously-provided unseal keys are discarded and the unseal process is reset.",
 				},
+				"migrate": {
+					Type:        framework.TypeBool,
+					Description: "Used to migrate the seal from shamir to autoseal or autoseal to shamir. Must be provided on all unseal key calls.",
+				},
 			},
 
 			Operations: map[logical.Operation]framework.OperationHandler{
@@ -1828,6 +1832,7 @@ func (b *SystemBackend) sealPaths() []*framework.Path {
 							Description: "OK",
 						}},
 					},
+					ForwardPerformanceStandby: true,
 				},
 			},
 
@@ -1885,6 +1890,10 @@ func (b *SystemBackend) pluginsCatalogCRUDPath() *framework.Path {
 			"version": {
 				Type:        framework.TypeString,
 				Description: strings.TrimSpace(sysHelp["plugin-catalog_version"][0]),
+			},
+			"download": {
+				Type:        framework.TypeBool,
+				Description: strings.TrimSpace(sysHelp["plugin-catalog_download"][0]),
 			},
 		},
 
@@ -2913,33 +2922,6 @@ func (b *SystemBackend) internalPaths() []*framework.Path {
 			HelpDescription: strings.TrimSpace(sysHelp["internal-counters-requests"][1]),
 		},
 		{
-			Pattern: "internal/counters/tokens",
-			DisplayAttrs: &framework.DisplayAttributes{
-				OperationPrefix: "internal",
-				OperationVerb:   "count",
-				OperationSuffix: "tokens",
-			},
-			Operations: map[logical.Operation]framework.OperationHandler{
-				logical.ReadOperation: &framework.PathOperation{
-					Callback: b.pathInternalCountersTokens,
-					Summary:  "Backwards compatibility is not guaranteed for this API",
-					Responses: map[int][]framework.Response{
-						http.StatusOK: {{
-							Description: "OK",
-							Fields: map[string]*framework.FieldSchema{
-								"counters": {
-									Type:     framework.TypeMap,
-									Required: true,
-								},
-							},
-						}},
-					},
-				},
-			},
-			HelpSynopsis:    strings.TrimSpace(sysHelp["internal-counters-tokens"][0]),
-			HelpDescription: strings.TrimSpace(sysHelp["internal-counters-tokens"][1]),
-		},
-		{
 			Pattern: "internal/counters/entities",
 			DisplayAttrs: &framework.DisplayAttributes{
 				OperationPrefix: "internal",
@@ -3101,6 +3083,10 @@ func (b *SystemBackend) capabilitiesPaths() []*framework.Path {
 				"paths": {
 					Type:        framework.TypeCommaStringSlice,
 					Description: "Paths on which capabilities are being queried.",
+				},
+				"namespace": {
+					Type:        framework.TypeString,
+					Description: "Namespace for which capabilities are being queried.",
 				},
 			},
 
@@ -3821,6 +3807,10 @@ func (b *SystemBackend) authPaths() []*framework.Path {
 					Description: strings.TrimSpace(sysHelp["identity_token_key"][0]),
 					Required:    false,
 				},
+				"trim_request_trailing_slashes": {
+					Type:     framework.TypeBool,
+					Required: false,
+				},
 			},
 			Operations: map[logical.Operation]framework.OperationHandler{
 				logical.ReadOperation: &framework.PathOperation{
@@ -3909,6 +3899,10 @@ func (b *SystemBackend) authPaths() []*framework.Path {
 								},
 								"identity_token_key": {
 									Type:     framework.TypeString,
+									Required: false,
+								},
+								"trim_request_trailing_slashes": {
+									Type:     framework.TypeBool,
 									Required: false,
 								},
 							},
@@ -4681,6 +4675,10 @@ func (b *SystemBackend) mountPaths() []*framework.Path {
 					Type:        framework.TypeString,
 					Description: strings.TrimSpace(sysHelp["identity_token_key"][0]),
 				},
+				"trim_request_trailing_slashes": {
+					Type:        framework.TypeBool,
+					Description: strings.TrimSpace(sysHelp["trim_request_trailing_slashes"][0]),
+				},
 			},
 
 			Operations: map[logical.Operation]framework.OperationHandler{
@@ -4781,6 +4779,10 @@ func (b *SystemBackend) mountPaths() []*framework.Path {
 								},
 								"identity_token_key": {
 									Type:     framework.TypeString,
+									Required: false,
+								},
+								"trim_request_trailing_slashes": {
+									Type:     framework.TypeBool,
 									Required: false,
 								},
 							},
@@ -5067,111 +5069,6 @@ func (b *SystemBackend) lockedUserPaths() []*framework.Path {
 			},
 			HelpSynopsis:    strings.TrimSpace(sysHelp["locked_users"][0]),
 			HelpDescription: strings.TrimSpace(sysHelp["locked_users"][1]),
-		},
-	}
-}
-
-func (b *SystemBackend) eventPaths() []*framework.Path {
-	return []*framework.Path{
-		{
-			Pattern: "events/subscriptions$",
-
-			DisplayAttrs: &framework.DisplayAttributes{
-				OperationPrefix: "subscriptions",
-				OperationVerb:   "create",
-			},
-
-			Fields: map[string]*framework.FieldSchema{
-				"config": {
-					Type:     framework.TypeMap,
-					Required: true,
-					// Description: strings.TrimSpace(sysHelp["mount_accessor"][0]),
-				},
-				"plugin": {
-					Type:     framework.TypeString,
-					Required: true,
-				},
-				//"alias_identifier": {
-				//	Type: framework.TypeString,
-				//	// Description: strings.TrimSpace(sysHelp["alias_identifier"][0]),
-				//},
-			},
-
-			Operations: map[logical.Operation]framework.OperationHandler{
-				logical.UpdateOperation: &framework.PathOperation{
-					Callback: b.handleEventsSubscribe,
-					Summary:  "",
-					Responses: map[int][]framework.Response{
-						http.StatusOK: {{
-							Description: "OK",
-							Fields: map[string]*framework.FieldSchema{
-								"id": {
-									Type:     framework.TypeString,
-									Required: true,
-								},
-							},
-						}},
-					},
-				},
-			},
-			// HelpSynopsis:    strings.TrimSpace(sysHelp["unlock_user"][0]),
-			// HelpDescription: strings.TrimSpace(sysHelp["unlock_user"][1]),
-		},
-		{
-			Pattern: "events/subscriptions/(?P<plugin>.+)/(?P<id>.+)",
-
-			DisplayAttrs: &framework.DisplayAttributes{
-				OperationPrefix: "subscriptions",
-				OperationVerb:   "create",
-			},
-
-			Fields: map[string]*framework.FieldSchema{
-				"plugin": {
-					Type: framework.TypeString,
-				},
-				"id": {
-					Type: framework.TypeString,
-					// Description: strings.TrimSpace(sysHelp["mount_accessor"][0]),
-				},
-				"list": {
-					Type: framework.TypeBool,
-				},
-				//"alias_identifier": {
-				//	Type: framework.TypeString,
-				//	// Description: strings.TrimSpace(sysHelp["alias_identifier"][0]),
-				//},
-			},
-			Operations: map[logical.Operation]framework.OperationHandler{
-				logical.ListOperation: &framework.PathOperation{
-					Callback: b.handleEventsListSubscriptions,
-					Summary:  "",
-					Responses: map[int][]framework.Response{
-						http.StatusNoContent: {{
-							Description: "OK",
-						}},
-					},
-				},
-				logical.ReadOperation: &framework.PathOperation{
-					Callback: b.handleEventsListSubscriptions,
-					Summary:  "",
-					Responses: map[int][]framework.Response{
-						http.StatusNoContent: {{
-							Description: "OK",
-						}},
-					},
-				},
-				logical.DeleteOperation: &framework.PathOperation{
-					Callback: b.handleEventsUnsubscribe,
-					Summary:  "",
-					Responses: map[int][]framework.Response{
-						http.StatusNoContent: {{
-							Description: "OK",
-						}},
-					},
-				},
-			},
-			// HelpSynopsis:    strings.TrimSpace(sysHelp["unlock_user"][0]),
-			// HelpDescription: strings.TrimSpace(sysHelp["unlock_user"][1]),
 		},
 	}
 }

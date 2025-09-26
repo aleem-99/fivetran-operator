@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package ocikms
 
 import (
@@ -77,6 +80,10 @@ func getOpts(opt ...wrapping.Option) (*options, error) {
 				return nil, err
 			}
 		}
+	}
+
+	if err := wrapping.ParsePaths(&opts.WithKeyId); err != nil {
+		return nil, err
 	}
 
 	return &opts, nil

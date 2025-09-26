@@ -1,5 +1,79 @@
 ## Unreleased
 
+## v0.24.0
+
+CHANGES:
+
+* Bump Go version to 1.24.3
+
+## v0.23.0
+
+CHANGES:
+
+* Support read/list of loaded snapshots [GH-188](https://github.com/hashicorp/vault-plugin-secrets-kv/pull/188)
+* Updated dependencies:
+  * `github.com/hashicorp/vault/sdk` v0.16.0 -> v0.17.0
+
+## v0.22.2
+
+CHANGES:
+
+* Fix casing of observation JSON [GH-189](https://github.com/hashicorp/vault-plugin-secrets-kv/pull/189)
+
+## v0.22.1
+
+CHANGES:
+
+* Downgraded dependency:
+  * `github.com/hashicorp/hcl` v1.0.1-vault-7 -> v1.0.1-vault-5
+
+## v0.22.0
+
+CHANGES:
+
+* Support generating KV observations [GH-186](https://github.com/hashicorp/vault-plugin-secrets-kv/pull/186)
+* Updated dependencies:
+  * `github.com/hashicorp/vault/api` v1.15.0 -> v1.16.0
+  * `github.com/hashicorp/vault/sdk` v0.14.1 -> v0.16.0
+  * `github.com/hashicorp/go-secure-stdlib/parseutil` v0.1.9 -> v0.2.0
+  * `google.golang.org/protobuf` v1.36.5-> v1.36.6
+  * `golang.org/x/crypto` v0.33.0 -> v0.35.0
+
+## v0.21.0
+
+CHANGES:
+
+* Updated dependencies:
+  * https://github.com/hashicorp/vault-plugin-secrets-kv/pull/175
+  * https://github.com/hashicorp/vault-plugin-secrets-kv/pull/177
+
+## v0.20.0
+
+BUG FIXES:
+
+* Fixes panic from occurring when renewing KVv1 secrets.
+
+CHANGES:
+
+* Updated dependencies:
+  * `github.com/hashicorp/vault/api` v1.13.0 -> v1.14.0
+  * `github.com/hashicorp/vault/sdk` v0.12.0 -> v0.13.0
+  * `github.com/go-test/deep` v1.1.0 -> v1.1.1
+  * `github.com/docker/docker` v25.0.5 -> v25.0.6
+  * `github.com/hashicorp/go-retryablehttp` v0.7.1 -> v0.7.7
+  * `google.golang.org/grpc` v1.64.0 -> v1.64.1
+
+## v0.19.0
+
+CHANGES:
+
+* Updated dependencies:
+  * `github.com/golang/protobuf` v1.5.3 -> v1.5.4
+  * `github.com/hashicorp/go-hclog` v1.6.2 -> v1.6.3
+  * `github.com/hashicorp/vault/api` v1.11.0 -> v1.13.0
+  * `github.com/hashicorp/vault/sdk` v0.10.2 -> v0.12.0
+  * `google.golang.org/protobuf` v1.33.0 -> v1.34.1
+
 ## 0.18.0
 
 CHANGES:

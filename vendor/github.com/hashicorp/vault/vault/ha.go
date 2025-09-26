@@ -24,6 +24,7 @@ import (
 	"github.com/hashicorp/vault/sdk/helper/certutil"
 	"github.com/hashicorp/vault/sdk/helper/consts"
 	"github.com/hashicorp/vault/sdk/helper/jsonutil"
+	"github.com/hashicorp/vault/sdk/helper/metricregistry"
 	"github.com/hashicorp/vault/sdk/logical"
 	"github.com/hashicorp/vault/sdk/physical"
 	"github.com/hashicorp/vault/vault/seal"
@@ -45,7 +46,29 @@ const (
 	// leaderPrefixCleanDelay is how long to wait between deletions
 	// of orphaned leader keys, to prevent slamming the backend.
 	leaderPrefixCleanDelay = 200 * time.Millisecond
+
+	haAllowedMissedHeartbeats = 2
 )
+
+func init() {
+	// Register metrics that we should always consistently report whether or not
+	// they've been hit recently. The help texts are taken verbatim from our
+	// telemetry reference docs so if updated should probably stay in sync.
+	metricregistry.RegisterSummaries([]metricregistry.SummaryDefinition{
+		{
+			Name: []string{"vault", "core", "step_down"},
+			Help: "Time required to step down cluster leadership",
+		},
+		{
+			Name: []string{"vault", "core", "leadership_setup_failed"},
+			Help: "Time taken by the most recent leadership setup failure",
+		},
+		{
+			Name: []string{"vault", "core", "leadership_lost"},
+			Help: "Total time that a high-availability cluster node last maintained leadership",
+		},
+	})
+}
 
 var (
 	addEnterpriseHaActors func(*Core, *run.Group) chan func()            = addEnterpriseHaActorsNoop
@@ -118,15 +141,16 @@ func (c *Core) getHAMembers() ([]HAStatusNode, error) {
 	for _, peerNode := range c.GetHAPeerNodesCached() {
 		lastEcho := peerNode.LastEcho
 		nodes = append(nodes, HAStatusNode{
-			Hostname:           peerNode.Hostname,
-			APIAddress:         peerNode.APIAddress,
-			ClusterAddress:     peerNode.ClusterAddress,
-			LastEcho:           &lastEcho,
-			Version:            peerNode.Version,
-			UpgradeVersion:     peerNode.UpgradeVersion,
-			RedundancyZone:     peerNode.RedundancyZone,
-			EchoDurationMillis: peerNode.EchoDuration.Milliseconds(),
-			ClockSkewMillis:    peerNode.ClockSkewMillis,
+			Hostname:                    peerNode.Hostname,
+			APIAddress:                  peerNode.APIAddress,
+			ClusterAddress:              peerNode.ClusterAddress,
+			LastEcho:                    &lastEcho,
+			Version:                     peerNode.Version,
+			UpgradeVersion:              peerNode.UpgradeVersion,
+			RedundancyZone:              peerNode.RedundancyZone,
+			EchoDurationMillis:          peerNode.EchoDuration.Milliseconds(),
+			ClockSkewMillis:             peerNode.ClockSkewMillis,
+			ReplicationPrimaryCanaryAge: peerNode.ReplicationPrimaryCanaryAge,
 		})
 	}
 
@@ -1200,4 +1224,38 @@ func (c *Core) SetNeverBecomeActive(on bool) {
 	} else {
 		atomic.StoreUint32(c.neverBecomeActive, 0)
 	}
+}
+
+func (c *Core) getRemovableHABackend() physical.RemovableNodeHABackend {
+	var haBackend physical.RemovableNodeHABackend
+	if removableHA, ok := c.ha.(physical.RemovableNodeHABackend); ok {
+		haBackend = removableHA
+	}
+
+	if removableHA, ok := c.underlyingPhysical.(physical.RemovableNodeHABackend); ok {
+		haBackend = removableHA
+	}
+
+	return haBackend
+}
+
+// GetHAHeartbeatHealth returns whether a node's last successful heartbeat was
+// more than 2 intervals ago. If the node's request forwarding clients were
+// cleared (due to the node being sealed or finding a new leader), or the node
+// is uninitialized, healthy will be false.
+func (c *Core) GetHAHeartbeatHealth() (healthy bool, sinceLastHeartbeat *time.Duration) {
+	heartbeat := c.rpcLastSuccessfulHeartbeat.Load()
+	if heartbeat == nil {
+		return false, nil
+	}
+	lastHeartbeat := heartbeat.(time.Time)
+	if lastHeartbeat.IsZero() {
+		return false, nil
+	}
+	diff := time.Now().Sub(lastHeartbeat)
+	heartbeatInterval := c.clusterHeartbeatInterval
+	if heartbeatInterval <= 0 {
+		heartbeatInterval = 5 * time.Second
+	}
+	return diff < heartbeatInterval*haAllowedMissedHeartbeats, &diff
 }

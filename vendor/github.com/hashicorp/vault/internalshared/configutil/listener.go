@@ -94,14 +94,16 @@ type Listener struct {
 	ProxyProtocolAuthorizedAddrs    []*sockaddr.SockAddrMarshaler `hcl:"-"`
 	ProxyProtocolAuthorizedAddrsRaw interface{}                   `hcl:"proxy_protocol_authorized_addrs,alias:ProxyProtocolAuthorizedAddrs"`
 
-	XForwardedForAuthorizedAddrs        []*sockaddr.SockAddrMarshaler `hcl:"-"`
-	XForwardedForAuthorizedAddrsRaw     interface{}                   `hcl:"x_forwarded_for_authorized_addrs,alias:XForwardedForAuthorizedAddrs"`
-	XForwardedForHopSkips               int64                         `hcl:"-"`
-	XForwardedForHopSkipsRaw            interface{}                   `hcl:"x_forwarded_for_hop_skips,alias:XForwardedForHopSkips"`
-	XForwardedForRejectNotPresent       bool                          `hcl:"-"`
-	XForwardedForRejectNotPresentRaw    interface{}                   `hcl:"x_forwarded_for_reject_not_present,alias:XForwardedForRejectNotPresent"`
-	XForwardedForRejectNotAuthorized    bool                          `hcl:"-"`
-	XForwardedForRejectNotAuthorizedRaw interface{}                   `hcl:"x_forwarded_for_reject_not_authorized,alias:XForwardedForRejectNotAuthorized"`
+	XForwardedForAuthorizedAddrs          []*sockaddr.SockAddrMarshaler `hcl:"-"`
+	XForwardedForAuthorizedAddrsRaw       interface{}                   `hcl:"x_forwarded_for_authorized_addrs,alias:XForwardedForAuthorizedAddrs"`
+	XForwardedForHopSkips                 int64                         `hcl:"-"`
+	XForwardedForHopSkipsRaw              interface{}                   `hcl:"x_forwarded_for_hop_skips,alias:XForwardedForHopSkips"`
+	XForwardedForRejectNotPresent         bool                          `hcl:"-"`
+	XForwardedForRejectNotPresentRaw      interface{}                   `hcl:"x_forwarded_for_reject_not_present,alias:XForwardedForRejectNotPresent"`
+	XForwardedForRejectNotAuthorized      bool                          `hcl:"-"`
+	XForwardedForRejectNotAuthorizedRaw   interface{}                   `hcl:"x_forwarded_for_reject_not_authorized,alias:XForwardedForRejectNotAuthorized"`
+	XForwardedForClientCertHeader         string                        `hcl:"x_forwarded_for_client_cert_header,alias:XForwardedForClientCertHeader"`
+	XForwardedForClientCertHeaderDecoders string                        `hcl:"x_forwarded_for_client_cert_header_decoders,alias:XForwardedForClientCertHeaderDecoders"`
 
 	SocketMode  string `hcl:"socket_mode"`
 	SocketUser  string `hcl:"socket_user"`
@@ -147,6 +149,24 @@ type Listener struct {
 	// DisableRequestLimiter allows per-listener disabling of the Request Limiter.
 	DisableRequestLimiterRaw any  `hcl:"disable_request_limiter"`
 	DisableRequestLimiter    bool `hcl:"-"`
+
+	// JSON-specific limits
+
+	// CustomMaxJSONDepth specifies the maximum nesting depth of a JSON object.
+	CustomMaxJSONDepthRaw interface{} `hcl:"max_json_depth"`
+	CustomMaxJSONDepth    int64       `hcl:"-"`
+
+	// CustomMaxJSONStringValueLength defines the maximum allowed length for a string in a JSON payload.
+	CustomMaxJSONStringValueLengthRaw interface{} `hcl:"max_json_string_value_length"`
+	CustomMaxJSONStringValueLength    int64       `hcl:"-"`
+
+	// CustomMaxJSONObjectEntryCount sets the maximum number of key-value pairs in a JSON object.
+	CustomMaxJSONObjectEntryCountRaw interface{} `hcl:"max_json_object_entry_count"`
+	CustomMaxJSONObjectEntryCount    int64       `hcl:"-"`
+
+	// CustomMaxJSONArrayElementCount determines the maximum number of elements in a JSON array.
+	CustomMaxJSONArrayElementCountRaw interface{} `hcl:"max_json_array_element_count"`
+	CustomMaxJSONArrayElementCount    int64       `hcl:"-"`
 }
 
 // AgentAPI allows users to select which parts of the Agent API they want enabled.
@@ -175,7 +195,7 @@ func (l *Listener) Validate(path string) []ConfigError {
 func ParseSingleIPTemplate(ipTmpl string) (string, error) {
 	r := regexp.MustCompile("{{.*?}}")
 	if !r.MatchString(ipTmpl) {
-		return ipTmpl, nil
+		return NormalizeAddr(ipTmpl), nil
 	}
 
 	out, err := template.Parse(ipTmpl)
@@ -466,6 +486,10 @@ func (l *Listener) parseRequestSettings() error {
 		return fmt.Errorf("invalid value for disable_request_limiter: %w", err)
 	}
 
+	if err := l.parseJSONLimitsSettings(); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -560,9 +584,9 @@ func (l *Listener) parseProxySettings() error {
 
 	// Validation/sanity check on allowed settings for behavior.
 	switch l.ProxyProtocolBehavior {
-	case "allow_authorized", "deny_authorized", "use_always", "":
+	case "allow_authorized", "deny_unauthorized", "use_always", "":
 		// Ignore these cases, they're all valid values.
-		// In the case of 'allow_authorized' and 'deny_authorized', we don't need
+		// In the case of 'allow_authorized' and 'deny_unauthorized', we don't need
 		// to check how many addresses we have in ProxyProtocolAuthorizedAddrs
 		// as parseutil.ParseAddrs returns "one or more addresses" (or an error)
 		// so we'd have returned earlier.
@@ -636,7 +660,7 @@ func (l *Listener) parseProfilingSettings() error {
 	return nil
 }
 
-// parseProfilingSettings attempts to parse the raw listener in-flight request logging settings.
+// parseInFlightRequestSettings attempts to parse the raw listener in-flight request logging settings.
 // The state of the listener will be modified, raw data will be cleared upon
 // successful parsing.
 func (l *Listener) parseInFlightRequestSettings() error {
@@ -705,6 +729,38 @@ func (l *Listener) parseRedactionSettings() error {
 	l.RedactAddressesRaw = nil
 	l.RedactClusterNameRaw = nil
 	l.RedactVersionRaw = nil
+
+	return nil
+}
+
+func (l *Listener) parseJSONLimitsSettings() error {
+	if err := parseAndClearInt(&l.CustomMaxJSONDepthRaw, &l.CustomMaxJSONDepth); err != nil {
+		return fmt.Errorf("error parsing max_json_depth: %w", err)
+	}
+	if l.CustomMaxJSONDepth < 0 {
+		return fmt.Errorf("max_json_depth cannot be negative")
+	}
+
+	if err := parseAndClearInt(&l.CustomMaxJSONStringValueLengthRaw, &l.CustomMaxJSONStringValueLength); err != nil {
+		return fmt.Errorf("error parsing max_json_string_value_length: %w", err)
+	}
+	if l.CustomMaxJSONStringValueLength < 0 {
+		return fmt.Errorf("max_json_string_value_length cannot be negative")
+	}
+
+	if err := parseAndClearInt(&l.CustomMaxJSONObjectEntryCountRaw, &l.CustomMaxJSONObjectEntryCount); err != nil {
+		return fmt.Errorf("error parsing max_json_object_entry_count: %w", err)
+	}
+	if l.CustomMaxJSONObjectEntryCount < 0 {
+		return fmt.Errorf("max_json_object_entry_count cannot be negative")
+	}
+
+	if err := parseAndClearInt(&l.CustomMaxJSONArrayElementCountRaw, &l.CustomMaxJSONArrayElementCount); err != nil {
+		return fmt.Errorf("error parsing max_json_array_element_count: %w", err)
+	}
+	if l.CustomMaxJSONArrayElementCount < 0 {
+		return fmt.Errorf("max_json_array_element_count cannot be negative")
+	}
 
 	return nil
 }

@@ -45,7 +45,13 @@ func (c *Core) IdentityStore() *IdentityStore {
 	return c.identityStore
 }
 
-func (i *IdentityStore) resetDB(ctx context.Context) error {
+func (i *IdentityStore) GetDisableLowerCasedNames() bool {
+	i.lock.RLock()
+	defer i.lock.RUnlock()
+	return i.disableLowerCasedNames
+}
+
+func (i *IdentityStore) resetDB() error {
 	var err error
 
 	i.db, err = memdb.NewMemDB(identityStoreSchema(!i.disableLowerCasedNames))
@@ -58,25 +64,27 @@ func (i *IdentityStore) resetDB(ctx context.Context) error {
 
 func NewIdentityStore(ctx context.Context, core *Core, config *logical.BackendConfig, logger log.Logger) (*IdentityStore, error) {
 	iStore := &IdentityStore{
-		view:          config.StorageView,
-		logger:        logger,
-		router:        core.router,
-		redirectAddr:  core.redirectAddr,
-		localNode:     core,
-		namespacer:    core,
-		metrics:       core.MetricSink(),
-		totpPersister: core,
-		groupUpdater:  core,
-		tokenStorer:   core,
-		entityCreator: core,
-		mountLister:   core,
-		mfaBackend:    core.loginMFABackend,
-		aliasLocks:    locksutil.CreateLocks(),
+		view:                   config.StorageView,
+		logger:                 logger,
+		router:                 core.router,
+		redirectAddr:           core.redirectAddr,
+		localNode:              core,
+		namespacer:             core,
+		metrics:                core.MetricSink(),
+		totpPersister:          core,
+		groupUpdater:           core,
+		tokenStorer:            core,
+		entityCreator:          core,
+		mountLister:            core,
+		mfaBackend:             core.loginMFABackend,
+		aliasLocks:             locksutil.CreateLocks(),
+		renameDuplicates:       core.FeatureActivationFlags,
+		activationErrorHandler: core,
 	}
 
 	// Create a memdb instance, which by default, operates on lower cased
 	// identity names
-	err := iStore.resetDB(ctx)
+	err := iStore.resetDB()
 	if err != nil {
 		return nil, err
 	}
@@ -108,6 +116,7 @@ func NewIdentityStore(ctx context.Context, core *Core, config *logical.BackendCo
 		Paths:          iStore.paths(),
 		Invalidate:     iStore.Invalidate,
 		InitializeFunc: iStore.initialize,
+		ActivationFunc: iStore.activateDeduplication,
 		PathsSpecial: &logical.Paths{
 			Unauthenticated: []string{
 				"oidc/.well-known/*",
@@ -120,7 +129,7 @@ func NewIdentityStore(ctx context.Context, core *Core, config *logical.BackendCo
 			},
 		},
 		PeriodicFunc: func(ctx context.Context, req *logical.Request) error {
-			iStore.oidcPeriodicFunc(ctx)
+			iStore.oidcPeriodicFunc(ctx, req.Storage)
 
 			return nil
 		},
@@ -141,6 +150,7 @@ func NewIdentityStore(ctx context.Context, core *Core, config *logical.BackendCo
 func (i *IdentityStore) paths() []*framework.Path {
 	return framework.PathAppend(
 		entityPaths(i),
+		entityTestonlyPaths(i),
 		aliasPaths(i),
 		groupAliasPaths(i),
 		groupPaths(i),
@@ -721,34 +731,53 @@ func (i *IdentityStore) invalidateEntityBucket(ctx context.Context, key string) 
 				}
 			}
 
-			// If the entity is not in MemDB or if it is but differs from the
-			// state that's in the bucket storage entry, upsert it into MemDB.
-
 			// We've considered the use of github.com/google/go-cmp here,
 			// but opted for sticking with reflect.DeepEqual because go-cmp
 			// is intended for testing and is able to panic in some
 			// situations.
-			if memDBEntity == nil || !reflect.DeepEqual(memDBEntity, bucketEntity) {
-				// The entity is not in MemDB, it's a new entity. Add it to MemDB.
-				err = i.upsertEntityInTxn(ctx, txn, bucketEntity, nil, false)
-				if err != nil {
-					i.logger.Error("failed to update entity in MemDB", "entity_id", bucketEntity.ID, "error", err)
+			if memDBEntity != nil && reflect.DeepEqual(memDBEntity, bucketEntity) {
+				// No changes on this entity, move on to the next one.
+				continue
+			}
+
+			// If the entity exists in MemDB it must differ from the entity in
+			// the storage bucket because of above test. Blindly delete the
+			// current aliases associated with the MemDB entity. The correct set
+			// of aliases will be created in MemDB by the upsertEntityInTxn
+			// function. We need to do this because the upsertEntityInTxn
+			// function does not delete those aliases, it only creates missing
+			// ones.
+			if memDBEntity != nil {
+				if err := i.deleteAliasesInEntityInTxn(txn, memDBEntity, memDBEntity.Aliases); err != nil {
+					i.logger.Error("failed to remove entity aliases from changed entity", "entity_id", memDBEntity.ID, "error", err)
 					return
 				}
 
-				// If this is a performance secondary, the entity created on
-				// this node would have been cached in a local cache based on
-				// the result of the CreateEntity RPC call to the primary
-				// cluster. Since this invalidation is signaling that the
-				// entity is now in the primary cluster's storage, the locally
-				// cached entry can be removed.
-				if i.localNode.ReplicationState().HasState(consts.ReplicationPerformanceSecondary) && i.localNode.HAState() == consts.Active {
-					if err := i.localAliasPacker.DeleteItem(ctx, bucketEntity.ID+tmpSuffix); err != nil {
-						i.logger.Error("failed to clear local alias entity cache", "error", err, "entity_id", bucketEntity.ID)
-						return
-					}
+				if err := i.MemDBDeleteEntityByIDInTxn(txn, memDBEntity.ID); err != nil {
+					i.logger.Error("failed to delete changed entity", "entity_id", memDBEntity.ID, "error", err)
+					return
 				}
 			}
+
+			_, err = i.upsertEntityInTxn(ctx, txn, bucketEntity, nil, false, false)
+			if err != nil {
+				i.logger.Error("failed to update entity in MemDB", "entity_id", bucketEntity.ID, "error", err)
+				return
+			}
+
+			// If this is a performance secondary, the entity created on
+			// this node would have been cached in a local cache based on
+			// the result of the CreateEntity RPC call to the primary
+			// cluster. Since this invalidation is signaling that the
+			// entity is now in the primary cluster's storage, the locally
+			// cached entry can be removed.
+			if i.localNode.ReplicationState().HasState(consts.ReplicationPerformanceSecondary) && i.localNode.HAState() == consts.Active {
+				if err := i.localAliasPacker.DeleteItem(ctx, bucketEntity.ID+tmpSuffix); err != nil {
+					i.logger.Error("failed to clear local alias entity cache", "error", err, "entity_id", bucketEntity.ID)
+					return
+				}
+			}
+
 		}
 	}
 
@@ -863,8 +892,7 @@ func (i *IdentityStore) invalidateOIDCToken(ctx context.Context) {
 		return
 	}
 
-	// Wipe the cache for the requested namespace. This will also clear
-	// the shared namespace as well.
+	// Wipe the cache for the requested namespace
 	if err := i.oidcCache.Flush(ns); err != nil {
 		i.logger.Error("error flushing oidc cache", "error", err)
 		return
@@ -1395,7 +1423,7 @@ func (i *IdentityStore) CreateOrFetchEntity(ctx context.Context, alias *logical.
 	}
 
 	// Update MemDB and persist entity object
-	err = i.upsertEntityInTxn(ctx, txn, entity, nil, true)
+	_, err = i.upsertEntityInTxn(ctx, txn, entity, nil, true, false)
 	if err != nil {
 		return entity, entityCreated, err
 	}

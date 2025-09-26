@@ -44,6 +44,11 @@ const (
 	credentialTableType = "auth"
 )
 
+func init() {
+	// Register the keys we use for auth "mount" tables
+	registerMountOrNamespaceTablePaths(coreAuthConfigPath, coreLocalAuthConfigPath)
+}
+
 var (
 	// errLoadAuthFailed if loadCredentials encounters an error
 	errLoadAuthFailed = errors.New("failed to setup auth table")
@@ -206,7 +211,7 @@ func (c *Core) enableCredentialInternal(ctx context.Context, entry *MountEntry, 
 			if err == logical.ErrReadOnly && c.perfStandby {
 				return err
 			}
-			return errors.New("failed to update auth table")
+			return fmt.Errorf("failed to update auth table: %w", err)
 		}
 	}
 
@@ -401,7 +406,7 @@ func (c *Core) removeCredEntry(ctx context.Context, path string, updateStorage b
 				return err
 			}
 
-			return errors.New("failed to update auth table")
+			return fmt.Errorf("failed to update auth table: %w", err)
 		}
 	}
 
@@ -480,15 +485,17 @@ func (c *Core) remountCredential(ctx context.Context, src, dst namespace.MountPa
 	srcMatch.Path = strings.TrimPrefix(dst.MountPath, credentialRoutePrefix)
 
 	// Update the mount table
-	if err := c.persistAuth(ctx, c.auth, &srcMatch.Local); err != nil {
-		srcMatch.Path = srcPath
-		srcMatch.Tainted = true
-		c.authLock.Unlock()
-		if err == logical.ErrReadOnly && c.perfStandby {
-			return err
-		}
+	if updateStorage {
+		if err := c.persistAuth(ctx, c.auth, &srcMatch.Local); err != nil {
+			srcMatch.Path = srcPath
+			srcMatch.Tainted = true
+			c.authLock.Unlock()
+			if err == logical.ErrReadOnly && c.perfStandby {
+				return err
+			}
 
-		return fmt.Errorf("failed to update auth table with error %+v", err)
+			return fmt.Errorf("failed to update auth table with error %+v", err)
+		}
 	}
 
 	// Remount the backend, setting the existing route entry
@@ -558,7 +565,7 @@ func (c *Core) taintCredEntry(ctx context.Context, nsID, path string, updateStor
 			if err == logical.ErrReadOnly && c.perfStandby {
 				return err
 			}
-			return errors.New("failed to update auth table")
+			return fmt.Errorf("failed to update auth table: %w", err)
 		}
 	}
 
@@ -955,6 +962,8 @@ func (c *Core) newCredentialBackend(ctx context.Context, entry *MountEntry, sysV
 	if err != nil {
 		return nil, err
 	}
+
+	conf := make(map[string]string)
 	var runningSha string
 	factory, ok := c.credentialBackends[t]
 	if !ok {
@@ -973,13 +982,22 @@ func (c *Core) newCredentialBackend(ctx context.Context, entry *MountEntry, sysV
 			runningSha = hex.EncodeToString(plug.Sha256)
 		}
 
+		if plug.Download {
+			if err = sysView.DownloadExtractVerifyPlugin(ctx, plug); err != nil {
+				return nil, fmt.Errorf("failed to extract and verify plugin=%q version=%q before mounting: %w",
+					plug.Name, plug.Version, err)
+			}
+		}
+
 		factory = plugin.Factory
 		if !plug.Builtin {
 			factory = wrapFactoryCheckPerms(c, plugin.Factory)
 		}
+
+		setExternalPluginConfig(plug, conf)
 	}
+
 	// Set up conf to pass in plugin_name
-	conf := make(map[string]string)
 	for k, v := range entry.Options {
 		conf[k] = v
 	}
@@ -1008,13 +1026,26 @@ func (c *Core) newCredentialBackend(ctx context.Context, entry *MountEntry, sysV
 		return nil, err
 	}
 
+	pluginObservationRecorder, err := c.observations.WithPlugin(entry.namespace, &logical.EventPluginInfo{
+		MountClass:    consts.PluginTypeCredential.String(),
+		MountAccessor: entry.Accessor,
+		MountPath:     entry.Path,
+		Plugin:        entry.Type,
+		PluginVersion: pluginVersion,
+		Version:       entry.Options["version"],
+	})
+	if err != nil {
+		return nil, err
+	}
+
 	config := &logical.BackendConfig{
-		StorageView:  view,
-		Logger:       authLogger,
-		Config:       conf,
-		System:       sysView,
-		BackendUUID:  entry.BackendAwareUUID,
-		EventsSender: pluginEventSender,
+		StorageView:         view,
+		Logger:              authLogger,
+		Config:              conf,
+		System:              sysView,
+		BackendUUID:         entry.BackendAwareUUID,
+		EventsSender:        pluginEventSender,
+		ObservationRecorder: pluginObservationRecorder,
 	}
 
 	backend, err := factory(ctx, config)

@@ -17,13 +17,11 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/big"
 	"net"
 	"net/url"
@@ -32,6 +30,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/errwrap"
+	"github.com/hashicorp/vault/sdk/helper/cryptoutil"
 	"github.com/hashicorp/vault/sdk/helper/errutil"
 	"github.com/hashicorp/vault/sdk/helper/jsonutil"
 	"github.com/mitchellh/mapstructure"
@@ -107,13 +106,16 @@ var KeyUsageOID = asn1.ObjectIdentifier([]int{2, 5, 29, 15})
 // id-ce-extKeyUsage OBJECT IDENTIFIER ::= { id-ce 37 }
 var ExtendedKeyUsageOID = asn1.ObjectIdentifier([]int{2, 5, 29, 37})
 
+// OID for Freshest (aka Delta) CRL from RFC 5280: https://datatracker.ietf.org/doc/html/rfc5280#section-4.2.1.15
+var FreshestCrlOid = asn1.ObjectIdentifier([]int{2, 5, 29, 46})
+
 // GetHexFormatted returns the byte buffer formatted in hex with
 // the specified separator between bytes.
 func GetHexFormatted(buf []byte, sep string) string {
 	var ret bytes.Buffer
 	for _, cur := range buf {
 		if ret.Len() > 0 {
-			fmt.Fprintf(&ret, sep)
+			fmt.Fprint(&ret, sep)
 		}
 		fmt.Fprintf(&ret, "%02x", cur)
 	}
@@ -313,8 +315,12 @@ func ParsePEMBundle(pemBundle string) (*ParsedCertBundle, error) {
 		}
 	}
 
-	if err := parsedBundle.Verify(); err != nil {
-		return nil, errutil.UserError{Err: fmt.Sprintf("verification of parsed bundle failed: %s", err)}
+	if len(certPath) > 1 {
+		// Don't validate the certificate chain if no certificate exists eg. only a key is given
+		// And don't validate a chain if it isn't given (eg. only one certificate)
+		if err := parsedBundle.Verify(); err != nil {
+			return nil, errutil.UserError{Err: fmt.Sprintf("verification of parsed bundle failed: %s", err)}
+		}
 	}
 
 	return parsedBundle, nil
@@ -370,7 +376,7 @@ func generatePrivateKey(keyType string, keyBits int, container ParsedPrivateKeyC
 			return errutil.InternalError{Err: fmt.Sprintf("insecure bit length for RSA private key: %d", keyBits)}
 		}
 		privateKeyType = RSAPrivateKey
-		privateKey, err = rsa.GenerateKey(randReader, keyBits)
+		privateKey, err = cryptoutil.GenerateRSAKey(randReader, keyBits)
 		if err != nil {
 			return errutil.InternalError{Err: fmt.Sprintf("error generating RSA private key: %v", err)}
 		}
@@ -533,9 +539,10 @@ func ParsePublicKeyPEM(data []byte) (interface{}, error) {
 func AddPolicyIdentifiers(data *CreationBundle, certTemplate *x509.Certificate) {
 	oidOnly := true
 	for _, oidStr := range data.Params.PolicyIdentifiers {
-		oid, err := StringToOid(oidStr)
+		// Compatible with Go 1.24 and higher only (or 1.22 with x509usepolicies=1)
+		x509Oid, err := x509.ParseOID(oidStr)
 		if err == nil {
-			certTemplate.PolicyIdentifiers = append(certTemplate.PolicyIdentifiers, oid)
+			certTemplate.Policies = append(certTemplate.Policies, x509Oid)
 		}
 		if err != nil {
 			oidOnly = false
@@ -940,10 +947,18 @@ func createCertificate(data *CreationBundle, randReader io.Reader, privateKeyGen
 	}
 
 	// This will only be filled in from the generation paths
-	if len(data.Params.PermittedDNSDomains) > 0 {
-		certTemplate.PermittedDNSDomains = data.Params.PermittedDNSDomains
-		certTemplate.PermittedDNSDomainsCritical = true
-	}
+	certTemplate.PermittedDNSDomains = append(certTemplate.PermittedDNSDomains, data.Params.PermittedDNSDomains...)
+	certTemplate.ExcludedDNSDomains = append(certTemplate.ExcludedDNSDomains, data.Params.ExcludedDNSDomains...)
+	certTemplate.PermittedIPRanges = append(certTemplate.PermittedIPRanges, data.Params.PermittedIPRanges...)
+	certTemplate.ExcludedIPRanges = append(certTemplate.ExcludedIPRanges, data.Params.ExcludedIPRanges...)
+	certTemplate.PermittedEmailAddresses = append(certTemplate.PermittedEmailAddresses, data.Params.PermittedEmailAddresses...)
+	certTemplate.ExcludedEmailAddresses = append(certTemplate.ExcludedEmailAddresses, data.Params.ExcludedEmailAddresses...)
+	certTemplate.PermittedURIDomains = append(certTemplate.PermittedURIDomains, data.Params.PermittedURIDomains...)
+	certTemplate.ExcludedURIDomains = append(certTemplate.ExcludedURIDomains, data.Params.ExcludedURIDomains...)
+	// Note that it is harmless to set PermittedDNSDomainsCritical even if all other
+	// permitted or excluded fields are empty, as the name constraints extension won't be created in
+	// that case
+	certTemplate.PermittedDNSDomainsCritical = true
 
 	AddPolicyIdentifiers(data, certTemplate)
 
@@ -953,6 +968,10 @@ func createCertificate(data *CreationBundle, randReader io.Reader, privateKeyGen
 
 	certTemplate.IssuingCertificateURL = data.Params.URLs.IssuingCertificates
 	certTemplate.CRLDistributionPoints = data.Params.URLs.CRLDistributionPoints
+	err = AddDeltaCRLExtension(data, certTemplate)
+	if err != nil {
+		return nil, err
+	}
 	certTemplate.OCSPServer = data.Params.URLs.OCSPServers
 
 	var certBytes []byte
@@ -1104,12 +1123,21 @@ func createCSR(data *CreationBundle, addBasicConstraints bool, randReader io.Rea
 	}
 
 	// Like many root CAs, other information is ignored
+
 	csrTemplate := &x509.CertificateRequest{
 		Subject:        data.Params.Subject,
 		DNSNames:       data.Params.DNSNames,
 		EmailAddresses: data.Params.EmailAddresses,
 		IPAddresses:    data.Params.IPAddresses,
 		URIs:           data.Params.URIs,
+	}
+
+	if data.Params.KeyUsage != 0 {
+		keyUsageExt, err := marshalKeyUsage(data.Params.KeyUsage)
+		if err != nil {
+			return nil, fmt.Errorf("failed marshalling existing key usage: %w", err)
+		}
+		csrTemplate.ExtraExtensions = []pkix.Extension{keyUsageExt}
 	}
 
 	if err := HandleOtherCSRSANs(csrTemplate, data.Params.OtherSANs); err != nil {
@@ -1161,6 +1189,56 @@ func createCSR(data *CreationBundle, addBasicConstraints bool, randReader io.Rea
 	return result, nil
 }
 
+// Marshal Key Usage taken from: https://cs.opensource.google/go/go/+/master:src/crypto/x509/x509.go;drc=370a6959e3edd9d901446661ee9fef3f72d150d4;l=1339
+// It requires the two following functions (reverseBitsInAByte and asn1BitLength) below, taken from the same code base
+// It's used for that code only for certificates; but we need to marshal key usage on CSR (createCSR above) as well
+func marshalKeyUsage(ku x509.KeyUsage) (pkix.Extension, error) {
+	ext := pkix.Extension{Id: KeyUsageOID, Critical: true}
+
+	var a [2]byte
+	a[0] = reverseBitsInAByte(byte(ku))
+	a[1] = reverseBitsInAByte(byte(ku >> 8))
+
+	l := 1
+	if a[1] != 0 {
+		l = 2
+	}
+
+	bitString := a[:l]
+	var err error
+	ext.Value, err = asn1.Marshal(asn1.BitString{Bytes: bitString, BitLength: asn1BitLength(bitString)})
+	return ext, err
+}
+
+// reverseBitsInAByte Taken from: https://cs.opensource.google/go/go/+/master:src/crypto/x509/x509.go;drc=370a6959e3edd9d901446661ee9fef3f72d150d4;l=1011
+// needed for marshalKeyUsage called above
+func reverseBitsInAByte(in byte) byte {
+	b1 := in>>4 | in<<4
+	b2 := b1>>2&0x33 | b1<<2&0xcc
+	b3 := b2>>1&0x55 | b2<<1&0xaa
+	return b3
+}
+
+// asn1BitLength returns the bit-length of bitString by considering the
+// most-significant bit in a byte to be the "first" bit. This convention
+// matches ASN.1, but differs from almost everything else.
+func asn1BitLength(bitString []byte) int {
+	bitLen := len(bitString) * 8
+
+	for i := range bitString {
+		b := bitString[len(bitString)-i-1]
+
+		for bit := uint(0); bit < 8; bit++ {
+			if (b>>bit)&1 == 1 {
+				return bitLen
+			}
+			bitLen--
+		}
+	}
+
+	return 0
+}
+
 // SignCertificate performs the heavy lifting
 // of generating a certificate from a CSR.
 // Returns a ParsedCertBundle sans private keys.
@@ -1187,9 +1265,10 @@ func signCertificate(data *CreationBundle, randReader io.Reader) (*ParsedCertBun
 		return nil, errutil.UserError{Err: "nil csr given to signCertificate"}
 	}
 
-	err := data.CSR.CheckSignature()
-	if err != nil {
-		return nil, errutil.UserError{Err: "request signature invalid"}
+	if !data.Params.IgnoreCSRSignature {
+		if err := data.CSR.CheckSignature(); err != nil {
+			return nil, errutil.UserError{Err: "request signature invalid"}
+		}
 	}
 
 	result := &ParsedCertBundle{}
@@ -1273,6 +1352,10 @@ func signCertificate(data *CreationBundle, randReader io.Reader) (*ParsedCertBun
 
 	certTemplate.IssuingCertificateURL = data.Params.URLs.IssuingCertificates
 	certTemplate.CRLDistributionPoints = data.Params.URLs.CRLDistributionPoints
+	err = AddDeltaCRLExtension(data, certTemplate)
+	if err != nil {
+		return nil, err
+	}
 	certTemplate.OCSPServer = data.SigningBundle.URLs.OCSPServers
 
 	if data.Params.IsCA {
@@ -1293,10 +1376,16 @@ func signCertificate(data *CreationBundle, randReader io.Reader) (*ParsedCertBun
 		certTemplate.IsCA = false
 	}
 
-	if len(data.Params.PermittedDNSDomains) > 0 {
-		certTemplate.PermittedDNSDomains = data.Params.PermittedDNSDomains
-		certTemplate.PermittedDNSDomainsCritical = true
-	}
+	certTemplate.PermittedDNSDomains = append(certTemplate.PermittedDNSDomains, data.Params.PermittedDNSDomains...)
+	certTemplate.ExcludedDNSDomains = append(certTemplate.ExcludedDNSDomains, data.Params.ExcludedDNSDomains...)
+	certTemplate.PermittedIPRanges = append(certTemplate.PermittedIPRanges, data.Params.PermittedIPRanges...)
+	certTemplate.ExcludedIPRanges = append(certTemplate.ExcludedIPRanges, data.Params.ExcludedIPRanges...)
+	certTemplate.PermittedEmailAddresses = append(certTemplate.PermittedEmailAddresses, data.Params.PermittedEmailAddresses...)
+	certTemplate.ExcludedEmailAddresses = append(certTemplate.ExcludedEmailAddresses, data.Params.ExcludedEmailAddresses...)
+	certTemplate.PermittedURIDomains = append(certTemplate.PermittedURIDomains, data.Params.PermittedURIDomains...)
+	certTemplate.ExcludedURIDomains = append(certTemplate.ExcludedURIDomains, data.Params.ExcludedURIDomains...)
+	// Note that it is harmless to set PermittedDNSDomainsCritical even if all other permitted/excluded fields are empty
+	certTemplate.PermittedDNSDomainsCritical = true
 
 	certBytes, err = x509.CreateCertificate(randReader, certTemplate, caCert, data.CSR.PublicKey, data.SigningBundle.PrivateKey)
 	if err != nil {
@@ -1315,7 +1404,7 @@ func signCertificate(data *CreationBundle, randReader io.Reader) (*ParsedCertBun
 }
 
 func NewCertPool(reader io.Reader) (*x509.CertPool, error) {
-	pemBlock, err := ioutil.ReadAll(reader)
+	pemBlock, err := io.ReadAll(reader)
 	if err != nil {
 		return nil, err
 	}
@@ -1637,17 +1726,26 @@ func getKeyUsage(exts []pkix.Extension) (x509.KeyUsage, error) {
 	keyUsage := x509.KeyUsage(0)
 	for _, ext := range exts {
 		if ext.Id.Equal(KeyUsageOID) {
-			// ASN1 is Big Endian
-			// another example of equivalent code: https://cs.opensource.google/go/go/+/master:src/crypto/x509/parser.go;drc=dd84bb682482390bb8465482cb7b13d2e3b17297;l=319
-			buf := bytes.NewReader(ext.Value)
-			err := binary.Read(buf, binary.BigEndian, &keyUsage)
-			if err != nil {
-				return keyUsage, err
-			}
-			return keyUsage, nil
+			return parseKeyUsageExtension(ext.Value)
 		}
 	}
 	return keyUsage, nil
+}
+
+// Taken from: https://cs.opensource.google/go/go/+/master:src/crypto/x509/parser.go;drc=dd84bb682482390bb8465482cb7b13d2e3b17297;l=319
+func parseKeyUsageExtension(der cryptobyte.String) (x509.KeyUsage, error) {
+	var usageBits asn1.BitString
+	if !der.ReadASN1BitString(&usageBits) {
+		return 0, errors.New("x509: invalid key usage")
+	}
+
+	var usage int
+	for i := 0; i < 9; i++ {
+		if usageBits.At(i) != 0 {
+			usage |= 1 << uint(i)
+		}
+	}
+	return x509.KeyUsage(usage), nil
 }
 
 func getExtKeyUsageOids(exts []pkix.Extension) ([]string, error) {
@@ -1724,7 +1822,15 @@ func ParseCertificateToCreationParameters(certificate x509.Certificate) (creatio
 		// The following two values are on creation parameters, but are impossible to parse from the certificate
 		// ForceAppendCaChain
 		// UseCSRValues
-		PermittedDNSDomains: certificate.PermittedDNSDomains,
+		PermittedDNSDomains:     certificate.PermittedDNSDomains,
+		ExcludedDNSDomains:      certificate.ExcludedDNSDomains,
+		PermittedIPRanges:       certificate.PermittedIPRanges,
+		ExcludedIPRanges:        certificate.ExcludedIPRanges,
+		PermittedEmailAddresses: certificate.PermittedEmailAddresses,
+		ExcludedEmailAddresses:  certificate.ExcludedEmailAddresses,
+		PermittedURIDomains:     certificate.PermittedURIDomains,
+		ExcludedURIDomains:      certificate.ExcludedURIDomains,
+
 		// URLs: punting on this for now
 		MaxPathLength:     certificate.MaxPathLen,
 		NotBeforeDuration: time.Now().Sub(certificate.NotBefore), // Assumes Certificate was created this moment
@@ -1866,31 +1972,46 @@ func ParseCertificateToFields(certificate x509.Certificate) (map[string]interfac
 	}
 
 	templateData := map[string]interface{}{
-		"common_name":           certificate.Subject.CommonName,
-		"alt_names":             MakeAltNamesCommaSeparatedString(certificate.DNSNames, certificate.EmailAddresses),
-		"ip_sans":               MakeIpAddressCommaSeparatedString(certificate.IPAddresses),
-		"uri_sans":              MakeUriCommaSeparatedString(certificate.URIs),
-		"other_sans":            otherSans,
-		"signature_bits":        FindSignatureBits(certificate.SignatureAlgorithm),
-		"exclude_cn_from_sans":  DetermineExcludeCnFromCertSans(certificate),
-		"ou":                    makeCommaSeparatedString(certificate.Subject.OrganizationalUnit),
-		"organization":          makeCommaSeparatedString(certificate.Subject.Organization),
-		"country":               makeCommaSeparatedString(certificate.Subject.Country),
-		"locality":              makeCommaSeparatedString(certificate.Subject.Locality),
-		"province":              makeCommaSeparatedString(certificate.Subject.Province),
-		"street_address":        makeCommaSeparatedString(certificate.Subject.StreetAddress),
-		"postal_code":           makeCommaSeparatedString(certificate.Subject.PostalCode),
-		"serial_number":         certificate.Subject.SerialNumber,
-		"ttl":                   (certificate.NotAfter.Sub(certificate.NotBefore)).String(),
-		"max_path_length":       certificate.MaxPathLen,
-		"permitted_dns_domains": strings.Join(certificate.PermittedDNSDomains, ","),
-		"use_pss":               IsPSS(certificate.SignatureAlgorithm),
-		"skid":                  hex.EncodeToString(certificate.SubjectKeyId),
-		"key_type":              GetKeyType(certificate.PublicKeyAlgorithm.String()),
-		"key_bits":              FindBitLength(certificate.PublicKey),
+		"common_name":               certificate.Subject.CommonName,
+		"alt_names":                 MakeAltNamesCommaSeparatedString(certificate.DNSNames, certificate.EmailAddresses),
+		"ip_sans":                   MakeIpAddressCommaSeparatedString(certificate.IPAddresses),
+		"uri_sans":                  MakeUriCommaSeparatedString(certificate.URIs),
+		"other_sans":                otherSans,
+		"signature_bits":            FindSignatureBits(certificate.SignatureAlgorithm),
+		"exclude_cn_from_sans":      DetermineExcludeCnFromCertSans(certificate),
+		"ou":                        makeCommaSeparatedString(certificate.Subject.OrganizationalUnit),
+		"organization":              makeCommaSeparatedString(certificate.Subject.Organization),
+		"country":                   makeCommaSeparatedString(certificate.Subject.Country),
+		"locality":                  makeCommaSeparatedString(certificate.Subject.Locality),
+		"province":                  makeCommaSeparatedString(certificate.Subject.Province),
+		"street_address":            makeCommaSeparatedString(certificate.Subject.StreetAddress),
+		"postal_code":               makeCommaSeparatedString(certificate.Subject.PostalCode),
+		"serial_number":             certificate.Subject.SerialNumber,
+		"ttl":                       (certificate.NotAfter.Sub(certificate.NotBefore)).String(),
+		"max_path_length":           certificate.MaxPathLen,
+		"permitted_dns_domains":     strings.Join(certificate.PermittedDNSDomains, ","),
+		"excluded_dns_domains":      strings.Join(certificate.ExcludedDNSDomains, ","),
+		"permitted_ip_ranges":       strings.Join(ipRangesToStrings(certificate.PermittedIPRanges), ","),
+		"excluded_ip_ranges":        strings.Join(ipRangesToStrings(certificate.ExcludedIPRanges), ","),
+		"permitted_email_addresses": strings.Join(certificate.PermittedEmailAddresses, ","),
+		"excluded_email_addresses":  strings.Join(certificate.ExcludedEmailAddresses, ","),
+		"permitted_uri_domains":     strings.Join(certificate.PermittedURIDomains, ","),
+		"excluded_uri_domains":      strings.Join(certificate.ExcludedURIDomains, ","),
+		"use_pss":                   IsPSS(certificate.SignatureAlgorithm),
+		"skid":                      hex.EncodeToString(certificate.SubjectKeyId),
+		"key_type":                  GetKeyType(certificate.PublicKeyAlgorithm.String()),
+		"key_bits":                  FindBitLength(certificate.PublicKey),
 	}
 
 	return templateData, nil
+}
+
+func ipRangesToStrings(ipRanges []*net.IPNet) []string {
+	var ret []string
+	for _, ipRange := range ipRanges {
+		ret = append(ret, ipRange.String())
+	}
+	return ret
 }
 
 func getBasicConstraintsFromExtension(exts []pkix.Extension) (found bool, isCA bool, maxPathLength int, err error) {
@@ -2039,4 +2160,100 @@ func IsPSS(algorithm x509.SignatureAlgorithm) bool {
 	default:
 		return false
 	}
+}
+
+// Per RFC 5280 4.2.1.15; the same as distribution point
+type deltaDistributionPoint struct {
+	DistributionPoint distributionPointName `asn1:"optional,tag:0"`
+	Reason            asn1.BitString        `asn1:"optional,tag:1"`
+	CRLIssuer         asn1.RawValue         `asn1:"optional,tag:2"`
+}
+type distributionPointName struct {
+	FullName     []asn1.RawValue  `asn1:"optional,tag:0"`
+	RelativeName pkix.RDNSequence `asn1:"optional,tag:1"`
+}
+
+func CreateDeltaCRLExtension(deltaUrls []string) (pkix.Extension, error) {
+	if deltaUrls == nil || len(deltaUrls) == 0 {
+		return pkix.Extension{}, fmt.Errorf("since no delta crl distribution points were provided, the extension returned is empty")
+	}
+	var deltaDistributionPoints []deltaDistributionPoint
+	for _, deltaUrl := range deltaUrls {
+		delta := deltaDistributionPoint{
+			DistributionPoint: distributionPointName{
+				FullName: []asn1.RawValue{
+					{
+						Tag:   6,
+						Class: 2,
+						Bytes: []byte(deltaUrl),
+					},
+				},
+			},
+		}
+		deltaDistributionPoints = append(deltaDistributionPoints, delta)
+	}
+	asn1Value, err := asn1.Marshal(deltaDistributionPoints)
+	if err != nil {
+		return pkix.Extension{}, err
+	}
+	return pkix.Extension{
+		Id:       FreshestCrlOid,
+		Value:    asn1Value,
+		Critical: false,
+	}, nil
+}
+
+// Adapted From: https://cs.opensource.google/go/go/+/master:src/crypto/x509/parser.go?q=CRLDistributionPoints&ss=go%2Fgo
+func ParseDeltaCRLExtension(certificate *x509.Certificate) ([]string, error) {
+	urls := []string{}
+	for _, extension := range certificate.Extensions {
+		if extension.Id.Equal(FreshestCrlOid) {
+			val := cryptobyte.String(extension.Value)
+			answer := !val.ReadASN1(&val, asn1.TagSequence|32)
+			if answer { // classConstructed SEQUENCE
+				return urls, errors.New("x509: invalid CRL distribution points")
+			}
+			for !val.Empty() {
+				var dpDER cryptobyte.String
+				if !val.ReadASN1(&dpDER, asn1.TagSequence|32) {
+					return urls, errors.New("x509: invalid CRL distribution point")
+				}
+				var dpNameDER cryptobyte.String
+				var dpNamePresent bool
+				if !dpDER.ReadOptionalASN1(&dpNameDER, &dpNamePresent, asn1.ClassUniversal|32|128) {
+					return urls, errors.New("x509: invalid CRL distribution point")
+				}
+				if !dpNamePresent {
+					continue
+				}
+				if !dpNameDER.ReadASN1(&dpNameDER, asn1.ClassUniversal|32|128) {
+					return urls, errors.New("x509: invalid CRL distribution point")
+				}
+				for !dpNameDER.Empty() {
+					if !dpNameDER.PeekASN1Tag(asn1.TagOID | 128) { // Context is GeneralName
+						break
+					}
+					var uri cryptobyte.String
+					if !dpNameDER.ReadASN1(&uri, asn1.TagOID|128) { // Context is GeneralName
+						return urls, errors.New("x509: invalid CRL distribution point")
+					}
+					urls = append(urls, string(uri))
+				}
+			}
+			return urls, nil
+		}
+	}
+	return urls, nil
+}
+
+func AddDeltaCRLExtension(data *CreationBundle, certTemplate *x509.Certificate) error {
+	if data.Params != nil && data.Params.URLs != nil && data.Params.URLs.DeltaCRLDistributionPoints != nil &&
+		len(data.Params.URLs.DeltaCRLDistributionPoints) > 0 {
+		extension, err := CreateDeltaCRLExtension(data.Params.URLs.DeltaCRLDistributionPoints)
+		if err != nil {
+			return fmt.Errorf("failed to create delta crl extension: %w", err)
+		}
+		certTemplate.ExtraExtensions = append(certTemplate.ExtraExtensions, extension)
+	}
+	return nil
 }

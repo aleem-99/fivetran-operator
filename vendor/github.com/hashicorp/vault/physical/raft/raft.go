@@ -10,10 +10,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math/rand"
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -21,13 +23,11 @@ import (
 
 	"github.com/armon/go-metrics"
 	"github.com/golang/protobuf/proto"
-	bolt "github.com/hashicorp-forge/bbolt"
 	log "github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/go-raftchunking"
 	"github.com/hashicorp/go-secure-stdlib/parseutil"
+	"github.com/hashicorp/go-secure-stdlib/permitpool"
 	"github.com/hashicorp/go-secure-stdlib/tlsutil"
-	"github.com/hashicorp/go-uuid"
-	goversion "github.com/hashicorp/go-version"
 	"github.com/hashicorp/raft"
 	autopilot "github.com/hashicorp/raft-autopilot"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
@@ -41,7 +41,8 @@ import (
 	"github.com/hashicorp/vault/sdk/logical"
 	"github.com/hashicorp/vault/sdk/physical"
 	"github.com/hashicorp/vault/vault/cluster"
-	etcdbolt "go.etcd.io/bbolt"
+	"github.com/hashicorp/vault/version"
+	bolt "go.etcd.io/bbolt"
 )
 
 const (
@@ -75,15 +76,20 @@ const (
 	defaultMaxBatchSize = 128 * 1024
 )
 
-var getMmapFlags = func(string) int { return 0 }
+var (
+	getMmapFlags     = func(string) int { return 0 }
+	usingMapPopulate = func(int) bool { return false }
+)
 
 // Verify RaftBackend satisfies the correct interfaces
 var (
-	_ physical.Backend             = (*RaftBackend)(nil)
-	_ physical.Transactional       = (*RaftBackend)(nil)
-	_ physical.TransactionalLimits = (*RaftBackend)(nil)
-	_ physical.HABackend           = (*RaftBackend)(nil)
-	_ physical.Lock                = (*RaftLock)(nil)
+	_ physical.Backend                   = (*RaftBackend)(nil)
+	_ physical.Transactional             = (*RaftBackend)(nil)
+	_ physical.TransactionalLimits       = (*RaftBackend)(nil)
+	_ physical.HABackend                 = (*RaftBackend)(nil)
+	_ physical.MountTableLimitingBackend = (*RaftBackend)(nil)
+	_ physical.RemovableNodeHABackend    = (*RaftBackend)(nil)
+	_ physical.Lock                      = (*RaftLock)(nil)
 )
 
 var (
@@ -171,12 +177,19 @@ type RaftBackend struct {
 	serverAddressProvider raft.ServerAddressProvider
 
 	// permitPool is used to limit the number of concurrent storage calls.
-	permitPool *physical.PermitPool
+	permitPool *permitpool.Pool
 
 	// maxEntrySize imposes a size limit (in bytes) on a raft entry (put or transaction).
 	// It is suggested to use a value of 2x the Raft chunking size for optimal
 	// performance.
 	maxEntrySize uint64
+
+	// maxMountAndNamespaceEntrySize imposes a size limit (in bytes) on a raft
+	// entry (put or transaction) for paths related to mount table and namespace
+	// metadata. The Raft storage doesn't "know" about these paths but Vault can
+	// call RegisterMountTablePath to inform it so that it can apply this
+	// alternate limit if one is configured.
+	maxMountAndNamespaceEntrySize uint64
 
 	// maxBatchEntries is the number of operation entries in each batch. It is set
 	// by default to a value we've tested to work well but may be overridden by
@@ -240,6 +253,55 @@ type RaftBackend struct {
 	// it writes checkpoints.
 	raftLogVerifierEnabled      bool
 	raftLogVerificationInterval time.Duration
+
+	// specialPathLimits is a map of special paths to their configured entrySize
+	// limits.
+	specialPathLimits map[string]uint64
+
+	removed              *atomic.Bool
+	removedCallback      func()
+	removedServerCleanup func(context.Context, string) (bool, error)
+}
+
+func (b *RaftBackend) IsNodeRemoved(ctx context.Context, nodeID string) (bool, error) {
+	conf, err := b.GetConfiguration(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, srv := range conf.Servers {
+		if srv.NodeID == nodeID {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func (b *RaftBackend) IsRemoved() bool {
+	return b.removed.Load()
+}
+
+var removedKey = []byte("removed")
+
+func (b *RaftBackend) RemoveSelf() error {
+	b.removed.Store(true)
+	return b.stableStore.SetUint64(removedKey, 1)
+}
+
+func (b *RaftBackend) SetRemovedServerCleanupFunc(f func(context.Context, string) (bool, error)) {
+	b.l.Lock()
+	b.removedServerCleanup = f
+	b.l.Unlock()
+}
+
+func (b *RaftBackend) RemovedServerCleanup(ctx context.Context, nodeID string) (bool, error) {
+	b.l.RLock()
+	defer b.l.RUnlock()
+
+	if b.removedServerCleanup != nil {
+		return b.removedServerCleanup(ctx, nodeID)
+	}
+
+	return false, nil
 }
 
 // LeaderJoinInfo contains information required by a node to join itself as a
@@ -295,25 +357,6 @@ type LeaderJoinInfo struct {
 
 	// TLSConfig for the API client to use when communicating with the leader node
 	TLSConfig *tls.Config `json:"-"`
-}
-
-type RaftBackendConfig struct {
-	Path                        string
-	NodeId                      string
-	ApplyDelay                  time.Duration
-	RaftWal                     bool
-	RaftLogVerifierEnabled      bool
-	RaftLogVerificationInterval time.Duration
-	SnapshotDelay               time.Duration
-	MaxEntrySize                uint64
-	MaxBatchEntries             int
-	MaxBatchSize                int
-	AutopilotReconcileInterval  time.Duration
-	AutopilotUpdateInterval     time.Duration
-	AutopilotUpgradeVersion     string
-	AutopilotRedundancyZone     string
-	RaftNonVoter                bool
-	RetryJoin                   string
 }
 
 // JoinConfig returns a list of information about possible leader nodes that
@@ -455,6 +498,7 @@ func NewRaftBackend(conf map[string]string, logger log.Logger) (physical.Backend
 		}
 	}
 
+	// Create the log store.
 	// Build an all in-memory setup for dev mode, otherwise prepare a full
 	// disk-based setup.
 	var logStore raft.LogStore
@@ -481,6 +525,7 @@ func NewRaftBackend(conf map[string]string, logger log.Logger) (physical.Backend
 		if err != nil {
 			return nil, fmt.Errorf("failed to check if raft.db already exists: %w", err)
 		}
+
 		if backendConfig.RaftWal && raftDbExists {
 			logger.Warn("raft is configured to use raft-wal for storage but existing raft.db detected. raft-wal config will be ignored.")
 			backendConfig.RaftWal = false
@@ -505,11 +550,15 @@ func NewRaftBackend(conf map[string]string, logger log.Logger) (physical.Backend
 			logStore = wal
 		} else {
 			// use the traditional BoltDB setup
-			opts := etcdboltOptions(dbPath)
+			opts := boltOptions(dbPath)
 			raftOptions := raftboltdb.Options{
 				Path:                    dbPath,
 				BoltOptions:             opts,
 				MsgpackUseNewTimeFormat: true,
+			}
+
+			if runtime.GOOS == "linux" && raftDbExists && !usingMapPopulate(opts.MmapFlags) {
+				logger.Warn("the MAP_POPULATE mmap flag has not been set before opening the log store database. This may be due to the database file being larger than the available memory on the system, or due to the VAULT_RAFT_DISABLE_MAP_POPULATE environment variable being set. As a result, Vault may be slower to start up.")
 			}
 
 			store, err := raftboltdb.New(raftOptions)
@@ -566,31 +615,64 @@ func NewRaftBackend(conf map[string]string, logger log.Logger) (physical.Backend
 		snapStore = newSnapshotStoreDelay(snapStore, backendConfig.SnapshotDelay, logger)
 	}
 
+	isRemoved := new(atomic.Bool)
+	removedVal, err := stableStore.GetUint64(removedKey)
+	if err != nil {
+		logger.Debug("error checking if this node is removed. continuing under the assumption that it's not", "error", err)
+	}
+	if removedVal == 1 {
+		isRemoved.Store(true)
+	}
 	return &RaftBackend{
-		logger:                      logger,
-		fsm:                         fsm,
-		raftInitCh:                  make(chan struct{}),
-		conf:                        conf,
-		logStore:                    logStore,
-		stableStore:                 stableStore,
-		snapStore:                   snapStore,
-		closers:                     closers,
-		dataDir:                     backendConfig.Path,
-		localID:                     backendConfig.NodeId,
-		permitPool:                  physical.NewPermitPool(physical.DefaultParallelOperations),
-		maxEntrySize:                backendConfig.MaxEntrySize,
-		maxBatchEntries:             backendConfig.MaxBatchEntries,
-		maxBatchSize:                backendConfig.MaxBatchSize,
-		followerHeartbeatTicker:     time.NewTicker(time.Second),
-		autopilotReconcileInterval:  backendConfig.AutopilotReconcileInterval,
-		autopilotUpdateInterval:     backendConfig.AutopilotUpdateInterval,
-		redundancyZone:              backendConfig.AutopilotRedundancyZone,
-		nonVoter:                    backendConfig.RaftNonVoter,
-		upgradeVersion:              backendConfig.AutopilotUpgradeVersion,
-		failGetInTxn:                new(uint32),
-		raftLogVerifierEnabled:      backendConfig.RaftLogVerifierEnabled,
-		raftLogVerificationInterval: backendConfig.RaftLogVerificationInterval,
+		logger:                        logger,
+		fsm:                           fsm,
+		raftInitCh:                    make(chan struct{}),
+		conf:                          conf,
+		logStore:                      logStore,
+		stableStore:                   stableStore,
+		snapStore:                     snapStore,
+		closers:                       closers,
+		dataDir:                       backendConfig.Path,
+		localID:                       backendConfig.NodeId,
+		permitPool:                    permitpool.New(physical.DefaultParallelOperations),
+		maxEntrySize:                  backendConfig.MaxEntrySize,
+		maxMountAndNamespaceEntrySize: backendConfig.MaxMountAndNamespaceTableEntrySize,
+		maxBatchEntries:               backendConfig.MaxBatchEntries,
+		maxBatchSize:                  backendConfig.MaxBatchSize,
+		followerHeartbeatTicker:       time.NewTicker(time.Second),
+		autopilotReconcileInterval:    backendConfig.AutopilotReconcileInterval,
+		autopilotUpdateInterval:       backendConfig.AutopilotUpdateInterval,
+		redundancyZone:                backendConfig.AutopilotRedundancyZone,
+		nonVoter:                      backendConfig.RaftNonVoter,
+		upgradeVersion:                backendConfig.AutopilotUpgradeVersion,
+		failGetInTxn:                  new(uint32),
+		raftLogVerifierEnabled:        backendConfig.RaftLogVerifierEnabled,
+		raftLogVerificationInterval:   backendConfig.RaftLogVerificationInterval,
+		effectiveSDKVersion:           version.GetVersion().Version,
+		removed:                       isRemoved,
 	}, nil
+}
+
+// RegisterMountTablePath informs the Backend that the given path represents
+// part of the mount tables or related metadata. This allows the backend to
+// apply different limits for this entry if configured to do so.
+func (b *RaftBackend) RegisterMountTablePath(path string) {
+	// We don't need to lock here because this is only called during startup
+
+	if b.maxMountAndNamespaceEntrySize > 0 {
+		// Set up the limit for this special path.
+		if b.specialPathLimits == nil {
+			b.specialPathLimits = make(map[string]uint64)
+		}
+		b.specialPathLimits[path] = b.maxMountAndNamespaceEntrySize
+	}
+}
+
+// GetSpecialPathLimits returns any paths registered with special entry size
+// limits. It's really only used to make integration testing of the plumbing for
+// these paths simpler.
+func (b *RaftBackend) GetSpecialPathLimits() map[string]uint64 {
+	return b.specialPathLimits
 }
 
 type snapshotStoreDelay struct {
@@ -646,12 +728,6 @@ func (b *RaftBackend) FailGetInTxn(fail bool) {
 	atomic.StoreUint32(b.failGetInTxn, val)
 }
 
-func (b *RaftBackend) SetEffectiveSDKVersion(sdkVersion string) {
-	b.l.Lock()
-	b.effectiveSDKVersion = sdkVersion
-	b.l.Unlock()
-}
-
 func (b *RaftBackend) RedundancyZone() string {
 	b.l.RLock()
 	defer b.l.RUnlock()
@@ -677,6 +753,12 @@ func (b *RaftBackend) UpgradeVersion() string {
 		return b.upgradeVersion
 	}
 
+	return b.effectiveSDKVersion
+}
+
+func (b *RaftBackend) SDKVersion() string {
+	b.l.RLock()
+	defer b.l.RUnlock()
 	return b.effectiveSDKVersion
 }
 
@@ -739,7 +821,9 @@ func (b *RaftBackend) applyVerifierCheckpoint() error {
 	data := make([]byte, 1)
 	data[0] = byte(verifierCheckpointOp)
 
-	b.permitPool.Acquire()
+	if err := b.permitPool.Acquire(context.Background()); err != nil {
+		return err
+	}
 	b.l.RLock()
 
 	var err error
@@ -813,7 +897,7 @@ func makeLogVerifyReportFn(logger log.Logger) verifier.ReportFn {
 
 func (b *RaftBackend) CollectMetrics(sink *metricsutil.ClusterMetricSink) {
 	var stats map[string]string
-	var logStoreStats *etcdbolt.Stats
+	var logStoreStats *bolt.Stats
 
 	b.l.RLock()
 	if boltStore, ok := b.stableStore.(*raftboltdb.BoltStore); ok {
@@ -829,7 +913,7 @@ func (b *RaftBackend) CollectMetrics(sink *metricsutil.ClusterMetricSink) {
 	b.l.RUnlock()
 
 	if logStoreStats != nil {
-		b.collectEtcdBoltMetricsWithStats(*logStoreStats, sink, "logstore")
+		b.collectMetricsWithStats(*logStoreStats, sink, "logstore")
 	}
 
 	b.collectMetricsWithStats(fsmStats, sink, "fsm")
@@ -851,29 +935,6 @@ func (b *RaftBackend) CollectMetrics(sink *metricsutil.ClusterMetricSink) {
 }
 
 func (b *RaftBackend) collectMetricsWithStats(stats bolt.Stats, sink *metricsutil.ClusterMetricSink, database string) {
-	txstats := stats.TxStats
-	labels := []metricsutil.Label{{"database", database}}
-	sink.SetGaugeWithLabels([]string{"raft_storage", "bolt", "freelist", "free_pages"}, float32(stats.FreePageN), labels)
-	sink.SetGaugeWithLabels([]string{"raft_storage", "bolt", "freelist", "pending_pages"}, float32(stats.PendingPageN), labels)
-	sink.SetGaugeWithLabels([]string{"raft_storage", "bolt", "freelist", "allocated_bytes"}, float32(stats.FreeAlloc), labels)
-	sink.SetGaugeWithLabels([]string{"raft_storage", "bolt", "freelist", "used_bytes"}, float32(stats.FreelistInuse), labels)
-	sink.SetGaugeWithLabels([]string{"raft_storage", "bolt", "transaction", "started_read_transactions"}, float32(stats.TxN), labels)
-	sink.SetGaugeWithLabels([]string{"raft_storage", "bolt", "transaction", "currently_open_read_transactions"}, float32(stats.OpenTxN), labels)
-	sink.SetGaugeWithLabels([]string{"raft_storage", "bolt", "page", "count"}, float32(txstats.GetPageCount()), labels)
-	sink.SetGaugeWithLabels([]string{"raft_storage", "bolt", "page", "bytes_allocated"}, float32(txstats.GetPageAlloc()), labels)
-	sink.SetGaugeWithLabels([]string{"raft_storage", "bolt", "cursor", "count"}, float32(txstats.GetCursorCount()), labels)
-	sink.SetGaugeWithLabels([]string{"raft_storage", "bolt", "node", "count"}, float32(txstats.GetNodeCount()), labels)
-	sink.SetGaugeWithLabels([]string{"raft_storage", "bolt", "node", "dereferences"}, float32(txstats.GetNodeDeref()), labels)
-	sink.SetGaugeWithLabels([]string{"raft_storage", "bolt", "rebalance", "count"}, float32(txstats.GetRebalance()), labels)
-	sink.AddSampleWithLabels([]string{"raft_storage", "bolt", "rebalance", "time"}, float32(txstats.GetRebalanceTime().Milliseconds()), labels)
-	sink.SetGaugeWithLabels([]string{"raft_storage", "bolt", "split", "count"}, float32(txstats.GetSplit()), labels)
-	sink.SetGaugeWithLabels([]string{"raft_storage", "bolt", "spill", "count"}, float32(txstats.GetSpill()), labels)
-	sink.AddSampleWithLabels([]string{"raft_storage", "bolt", "spill", "time"}, float32(txstats.GetSpillTime().Milliseconds()), labels)
-	sink.SetGaugeWithLabels([]string{"raft_storage", "bolt", "write", "count"}, float32(txstats.GetWrite()), labels)
-	sink.IncrCounterWithLabels([]string{"raft_storage", "bolt", "write", "time"}, float32(txstats.GetWriteTime().Milliseconds()), labels)
-}
-
-func (b *RaftBackend) collectEtcdBoltMetricsWithStats(stats etcdbolt.Stats, sink *metricsutil.ClusterMetricSink, database string) {
 	txstats := stats.TxStats
 	labels := []metricsutil.Label{{"database", database}}
 	sink.SetGaugeWithLabels([]string{"raft_storage", "bolt", "freelist", "free_pages"}, float32(stats.FreePageN), labels)
@@ -1003,9 +1064,15 @@ func (b *RaftBackend) SetRestoreCallback(restoreCb restoreCallback) {
 	b.fsm.l.Unlock()
 }
 
-func (b *RaftBackend) applyConfigSettings(config *raft.Config) error {
-	config.Logger = b.logger
-	multiplierRaw, ok := b.conf["performance_multiplier"]
+func (b *RaftBackend) SetRemovedCallback(cb func()) {
+	b.l.Lock()
+	defer b.l.Unlock()
+	b.removedCallback = cb
+}
+
+func ApplyConfigSettings(logger log.Logger, parsedConf map[string]string, config *raft.Config) error {
+	config.Logger = logger
+	multiplierRaw, ok := parsedConf["performance_multiplier"]
 	multiplier := 5
 	if ok {
 		var err error
@@ -1018,7 +1085,7 @@ func (b *RaftBackend) applyConfigSettings(config *raft.Config) error {
 	config.HeartbeatTimeout *= time.Duration(multiplier)
 	config.LeaderLeaseTimeout *= time.Duration(multiplier)
 
-	snapThresholdRaw, ok := b.conf["snapshot_threshold"]
+	snapThresholdRaw, ok := parsedConf["snapshot_threshold"]
 	if ok {
 		var err error
 		snapThreshold, err := strconv.Atoi(snapThresholdRaw)
@@ -1028,7 +1095,7 @@ func (b *RaftBackend) applyConfigSettings(config *raft.Config) error {
 		config.SnapshotThreshold = uint64(snapThreshold)
 	}
 
-	trailingLogsRaw, ok := b.conf["trailing_logs"]
+	trailingLogsRaw, ok := parsedConf["trailing_logs"]
 	if ok {
 		var err error
 		trailingLogs, err := strconv.Atoi(trailingLogsRaw)
@@ -1037,7 +1104,7 @@ func (b *RaftBackend) applyConfigSettings(config *raft.Config) error {
 		}
 		config.TrailingLogs = uint64(trailingLogs)
 	}
-	snapshotIntervalRaw, ok := b.conf["snapshot_interval"]
+	snapshotIntervalRaw, ok := parsedConf["snapshot_interval"]
 	if ok {
 		var err error
 		snapshotInterval, err := parseutil.ParseDurationSecond(snapshotIntervalRaw)
@@ -1055,7 +1122,7 @@ func (b *RaftBackend) applyConfigSettings(config *raft.Config) error {
 	// scheduler.
 	config.BatchApplyCh = true
 
-	b.logger.Trace("applying raft config", "inputs", b.conf)
+	logger.Trace("applying raft config", "inputs", parsedConf)
 	return nil
 }
 
@@ -1075,9 +1142,17 @@ type SetupOpts struct {
 	// RecoveryModeConfig is the configuration for the raft cluster in recovery
 	// mode.
 	RecoveryModeConfig *raft.Configuration
+
+	// EffectiveSDKVersion is typically the version string baked into the binary.
+	// We pass it in though because it can be overridden in tests or via ENV in
+	// core.
+	EffectiveSDKVersion string
+
+	// RemovedCallback is the function to call when the node has been removed
+	RemovedCallback func()
 }
 
-func (b *RaftBackend) StartRecoveryCluster(ctx context.Context, peer Peer) error {
+func (b *RaftBackend) StartRecoveryCluster(ctx context.Context, peer Peer, removedCallback func()) error {
 	recoveryModeConfig := &raft.Configuration{
 		Servers: []raft.Server{
 			{
@@ -1090,6 +1165,7 @@ func (b *RaftBackend) StartRecoveryCluster(ctx context.Context, peer Peer) error
 	return b.SetupCluster(context.Background(), SetupOpts{
 		StartAsLeader:      true,
 		RecoveryModeConfig: recoveryModeConfig,
+		RemovedCallback:    removedCallback,
 	})
 }
 
@@ -1118,9 +1194,14 @@ func (b *RaftBackend) SetupCluster(ctx context.Context, opts SetupOpts) error {
 		return errors.New("no local node id configured")
 	}
 
+	if opts.EffectiveSDKVersion != "" {
+		// Override the SDK version
+		b.effectiveSDKVersion = opts.EffectiveSDKVersion
+	}
+
 	// Setup the raft config
 	raftConfig := raft.DefaultConfig()
-	if err := b.applyConfigSettings(raftConfig); err != nil {
+	if err := ApplyConfigSettings(b.logger, b.conf, raftConfig); err != nil {
 		return err
 	}
 
@@ -1354,6 +1435,11 @@ func (b *RaftBackend) SetupCluster(ctx context.Context, opts SetupOpts) error {
 		}
 	}
 
+	if opts.RemovedCallback != nil {
+		b.removedCallback = opts.RemovedCallback
+	}
+	b.StartRemovedChecker(ctx)
+
 	b.logger.Trace("finished setting up raft cluster")
 	return nil
 }
@@ -1385,6 +1471,58 @@ func (b *RaftBackend) TeardownCluster(clusterListener cluster.ClusterHook) error
 	}
 
 	return nil
+}
+
+func (b *RaftBackend) StartRemovedChecker(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		hasBeenPresent := false
+
+		logger := b.logger.Named("removed.checker")
+		for {
+			select {
+			case <-ticker.C:
+				// If the raft cluster has been torn down (which will happen on
+				// seal) the raft backend will be uninitialized. We want to exit
+				// the loop in that case. If the cluster unseals, we'll get a
+				// new backend setup and that will have its own removed checker.
+
+				// There is a ctx.Done() check below that will also exit, but
+				// in most (if not all) places we pass in context.Background()
+				// to this function. Checking initialization will prevent this
+				// loop from continuing to run after the raft backend is stopped
+				// regardless of the context.
+				if !b.Initialized() {
+					return
+				}
+				removed, err := b.IsNodeRemoved(ctx, b.localID)
+				if err != nil {
+					logger.Error("failed to check if node is removed", "node ID", b.localID, "error", err)
+					continue
+				}
+				if !removed {
+					hasBeenPresent = true
+				}
+				// the node must have been previously present in the config,
+				// only then should we consider it removed and shutdown
+				if removed && hasBeenPresent {
+					err := b.RemoveSelf()
+					if err != nil {
+						logger.Error("failed to remove self", "node ID", b.localID, "error", err)
+					}
+					b.l.RLock()
+					if b.removedCallback != nil {
+						b.removedCallback()
+					}
+					b.l.RUnlock()
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 }
 
 // CommittedIndex returns the latest index committed to stable storage
@@ -1689,7 +1827,9 @@ func (b *RaftBackend) Delete(ctx context.Context, path string) error {
 			},
 		},
 	}
-	b.permitPool.Acquire()
+	if err := b.permitPool.Acquire(ctx); err != nil {
+		return err
+	}
 	defer b.permitPool.Release()
 
 	b.l.RLock()
@@ -1709,7 +1849,9 @@ func (b *RaftBackend) Get(ctx context.Context, path string) (*physical.Entry, er
 		return nil, err
 	}
 
-	b.permitPool.Acquire()
+	if err := b.permitPool.Acquire(ctx); err != nil {
+		return nil, err
+	}
 	defer b.permitPool.Release()
 
 	if err := ctx.Err(); err != nil {
@@ -1719,9 +1861,10 @@ func (b *RaftBackend) Get(ctx context.Context, path string) (*physical.Entry, er
 	entry, err := b.fsm.Get(ctx, path)
 	if entry != nil {
 		valueLen := len(entry.Value)
-		if uint64(valueLen) > b.maxEntrySize {
-			b.logger.Warn("retrieved entry value is too large, has raft's max_entry_size been reduced?",
-				"size", valueLen, "max_entry_size", b.maxEntrySize)
+		maxSize := b.entrySizeLimitForPath(path)
+		if uint64(valueLen) > maxSize {
+			b.logger.Warn("retrieved entry value is too large, has raft's max_entry_size or max_mount_and_namespace_table_entry_size been reduced?",
+				"size", valueLen, "max_size", maxSize)
 		}
 	}
 
@@ -1751,7 +1894,9 @@ func (b *RaftBackend) Put(ctx context.Context, entry *physical.Entry) error {
 		},
 	}
 
-	b.permitPool.Acquire()
+	if err := b.permitPool.Acquire(ctx); err != nil {
+		return err
+	}
 	defer b.permitPool.Release()
 
 	b.l.RLock()
@@ -1771,7 +1916,9 @@ func (b *RaftBackend) List(ctx context.Context, prefix string) ([]string, error)
 		return nil, err
 	}
 
-	b.permitPool.Acquire()
+	if err := b.permitPool.Acquire(ctx); err != nil {
+		return nil, err
+	}
 	defer b.permitPool.Release()
 
 	if err := ctx.Err(); err != nil {
@@ -1826,7 +1973,9 @@ func (b *RaftBackend) Transaction(ctx context.Context, txns []*physical.TxnEntry
 		command.Operations[i] = op
 	}
 
-	b.permitPool.Acquire()
+	if err := b.permitPool.Acquire(ctx); err != nil {
+		return err
+	}
 	defer b.permitPool.Release()
 
 	b.l.RLock()
@@ -1849,6 +1998,31 @@ func (b *RaftBackend) TransactionLimits() (int, int) {
 	return b.maxBatchEntries, b.maxBatchSize
 }
 
+// validateCommandEntrySizes is a helper to check the size of each transaction
+// value isn't larger than is allowed. It must take into account the path in
+// case any special limits have been set for mount table paths. Finally it
+// returns the largest limit it needed to use so that calling code can size the
+// overall log entry check correctly. In other words if max_entry_size is 1MB
+// and max_mount_and_namespace_table_entry_size is 2MB, we check each key
+// against the right limit and then return 1MB unless there is at least one
+// mount table key being written in which case we allow the larger limit of 2MB.
+func (b *RaftBackend) validateCommandEntrySizes(command *LogData) (uint64, error) {
+	largestEntryLimit := b.maxEntrySize
+
+	for _, op := range command.Operations {
+		if op.OpType == putOp {
+			entrySize := b.entrySizeLimitForPath(op.Key)
+			if len(op.Value) > int(entrySize) {
+				return 0, fmt.Errorf("%s, max value size for key %s is %d, got %d", physical.ErrValueTooLarge, op.Key, entrySize, len(op.Value))
+			}
+			if entrySize > largestEntryLimit {
+				largestEntryLimit = entrySize
+			}
+		}
+	}
+	return largestEntryLimit, nil
+}
+
 // applyLog will take a given log command and apply it to the raft log. applyLog
 // doesn't return until the log has been applied to a quorum of servers and is
 // persisted to the local FSM. Caller should hold the backend's read lock.
@@ -1860,14 +2034,19 @@ func (b *RaftBackend) applyLog(ctx context.Context, command *LogData) error {
 		return err
 	}
 
+	totalLogSizeLimit, err := b.validateCommandEntrySizes(command)
+	if err != nil {
+		return err
+	}
+
 	commandBytes, err := proto.Marshal(command)
 	if err != nil {
 		return err
 	}
 
 	cmdSize := len(commandBytes)
-	if uint64(cmdSize) > b.maxEntrySize {
-		return fmt.Errorf("%s; got %d bytes, max: %d bytes", physical.ErrValueTooLarge, cmdSize, b.maxEntrySize)
+	if uint64(cmdSize) > totalLogSizeLimit {
+		return fmt.Errorf("%s; got %d bytes, max: %d bytes", physical.ErrValueTooLarge, cmdSize, totalLogSizeLimit)
 	}
 
 	defer metrics.AddSample([]string{"raft-storage", "entry_size"}, float32(cmdSize))
@@ -2122,248 +2301,6 @@ func fileExists(name string) (bool, error) {
 	return false, err
 }
 
-func parseRaftBackendConfig(conf map[string]string, logger log.Logger) (*RaftBackendConfig, error) {
-	c := &RaftBackendConfig{}
-
-	c.Path = conf["path"]
-	envPath := os.Getenv(EnvVaultRaftPath)
-	if envPath != "" {
-		c.Path = envPath
-	}
-
-	if c.Path == "" {
-		return nil, fmt.Errorf("'path' must be set")
-	}
-
-	c.NodeId = conf["node_id"]
-	envNodeId := os.Getenv(EnvVaultRaftNodeID)
-	if envNodeId != "" {
-		c.NodeId = envNodeId
-	}
-
-	if c.NodeId == "" {
-		localIDRaw, err := os.ReadFile(filepath.Join(c.Path, "node-id"))
-		if err == nil && len(localIDRaw) > 0 {
-			c.NodeId = string(localIDRaw)
-		}
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return nil, err
-		}
-	}
-
-	if c.NodeId == "" {
-		id, err := uuid.GenerateUUID()
-		if err != nil {
-			return nil, err
-		}
-
-		if err = os.WriteFile(filepath.Join(c.Path, "node-id"), []byte(id), 0o600); err != nil {
-			return nil, err
-		}
-
-		c.NodeId = id
-	}
-
-	if delayRaw, ok := conf["apply_delay"]; ok {
-		delay, err := parseutil.ParseDurationSecond(delayRaw)
-		if err != nil {
-			return nil, fmt.Errorf("apply_delay does not parse as a duration: %w", err)
-		}
-
-		c.ApplyDelay = delay
-	}
-
-	if walRaw, ok := conf["raft_wal"]; ok {
-		useRaftWal, err := strconv.ParseBool(walRaw)
-		if err != nil {
-			return nil, fmt.Errorf("raft_wal does not parse as a boolean: %w", err)
-		}
-
-		c.RaftWal = useRaftWal
-	}
-
-	if rlveRaw, ok := conf["raft_log_verifier_enabled"]; ok {
-		rlve, err := strconv.ParseBool(rlveRaw)
-		if err != nil {
-			return nil, fmt.Errorf("raft_log_verifier_enabled does not parse as a boolean: %w", err)
-		}
-		c.RaftLogVerifierEnabled = rlve
-
-		c.RaftLogVerificationInterval = defaultRaftLogVerificationInterval
-		if rlviRaw, ok := conf["raft_log_verification_interval"]; ok {
-			rlvi, err := parseutil.ParseDurationSecond(rlviRaw)
-			if err != nil {
-				return nil, fmt.Errorf("raft_log_verification_interval does not parse as a duration: %w", err)
-			}
-
-			// Make sure our interval is capped to a reasonable value, so e.g. people don't use 0s or 1s
-			if rlvi >= minimumRaftLogVerificationInterval {
-				c.RaftLogVerificationInterval = rlvi
-			} else {
-				logger.Warn("raft_log_verification_interval is less than the minimum allowed, using default instead",
-					"given", rlveRaw,
-					"minimum", minimumRaftLogVerificationInterval,
-					"default", defaultRaftLogVerificationInterval)
-			}
-		}
-	}
-
-	if delayRaw, ok := conf["snapshot_delay"]; ok {
-		delay, err := parseutil.ParseDurationSecond(delayRaw)
-		if err != nil {
-			return nil, fmt.Errorf("snapshot_delay does not parse as a duration: %w", err)
-		}
-		c.SnapshotDelay = delay
-	}
-
-	c.MaxEntrySize = defaultMaxEntrySize
-	if maxEntrySizeCfg := conf["max_entry_size"]; len(maxEntrySizeCfg) != 0 {
-		i, err := strconv.Atoi(maxEntrySizeCfg)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse 'max_entry_size': %w", err)
-		}
-
-		c.MaxEntrySize = uint64(i)
-	}
-
-	c.MaxBatchEntries, c.MaxBatchSize = batchLimitsFromEnv(logger)
-
-	if interval := conf["autopilot_reconcile_interval"]; interval != "" {
-		interval, err := parseutil.ParseDurationSecond(interval)
-		if err != nil {
-			return nil, fmt.Errorf("autopilot_reconcile_interval does not parse as a duration: %w", err)
-		}
-		c.AutopilotReconcileInterval = interval
-	}
-
-	if interval := conf["autopilot_update_interval"]; interval != "" {
-		interval, err := parseutil.ParseDurationSecond(interval)
-		if err != nil {
-			return nil, fmt.Errorf("autopilot_update_interval does not parse as a duration: %w", err)
-		}
-		c.AutopilotUpdateInterval = interval
-	}
-
-	effectiveReconcileInterval := autopilot.DefaultReconcileInterval
-	effectiveUpdateInterval := autopilot.DefaultUpdateInterval
-
-	if c.AutopilotReconcileInterval != 0 {
-		effectiveReconcileInterval = c.AutopilotReconcileInterval
-	}
-	if c.AutopilotUpdateInterval != 0 {
-		effectiveUpdateInterval = c.AutopilotUpdateInterval
-	}
-
-	if effectiveReconcileInterval < effectiveUpdateInterval {
-		return nil, fmt.Errorf("autopilot_reconcile_interval (%v) should be larger than autopilot_update_interval (%v)", effectiveReconcileInterval, effectiveUpdateInterval)
-	}
-
-	if uv, ok := conf["autopilot_upgrade_version"]; ok && uv != "" {
-		_, err := goversion.NewVersion(uv)
-		if err != nil {
-			return nil, fmt.Errorf("autopilot_upgrade_version does not parse as a semantic version: %w", err)
-		}
-
-		c.AutopilotUpgradeVersion = uv
-	}
-
-	c.RaftNonVoter = false
-	if v := os.Getenv(EnvVaultRaftNonVoter); v != "" {
-		// Consistent with handling of other raft boolean env vars
-		// VAULT_RAFT_AUTOPILOT_DISABLE and VAULT_RAFT_FREELIST_SYNC
-		c.RaftNonVoter = true
-	} else if v, ok := conf[raftNonVoterConfigKey]; ok {
-		nonVoter, err := strconv.ParseBool(v)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse %s config value %q as a boolean: %w", raftNonVoterConfigKey, v, err)
-		}
-
-		c.RaftNonVoter = nonVoter
-	}
-
-	if c.RaftNonVoter && conf["retry_join"] == "" {
-		return nil, fmt.Errorf("setting %s to true is only valid if at least one retry_join stanza is specified", raftNonVoterConfigKey)
-	}
-
-	c.AutopilotRedundancyZone = conf["autopilot_redundancy_zone"]
-
-	return c, nil
-}
-
-// boltOptions returns a bolt.Options struct, suitable for passing to
-// bolt.Open(), pre-configured with all of our preferred defaults.
-func boltOptions(path string) *bolt.Options {
-	o := &bolt.Options{
-		Timeout:        1 * time.Second,
-		FreelistType:   bolt.FreelistMapType,
-		NoFreelistSync: true,
-		MmapFlags:      getMmapFlags(path),
-	}
-
-	if os.Getenv("VAULT_RAFT_FREELIST_TYPE") == "array" {
-		o.FreelistType = bolt.FreelistArrayType
-	}
-
-	if os.Getenv("VAULT_RAFT_FREELIST_SYNC") != "" {
-		o.NoFreelistSync = false
-	}
-
-	// By default, we want to set InitialMmapSize to 100GB, but only on 64bit platforms.
-	// Otherwise, we set it to whatever the value of VAULT_RAFT_INITIAL_MMAP_SIZE
-	// is, assuming it can be parsed as an int. Bolt itself sets this to 0 by default,
-	// so if users are wanting to turn this off, they can also set it to 0. Setting it
-	// to a negative value is the same as not setting it at all.
-	if os.Getenv("VAULT_RAFT_INITIAL_MMAP_SIZE") == "" {
-		o.InitialMmapSize = initialMmapSize
-	} else {
-		imms, err := strconv.Atoi(os.Getenv("VAULT_RAFT_INITIAL_MMAP_SIZE"))
-
-		// If there's an error here, it means they passed something that's not convertible to
-		// a number. Rather than fail startup, just ignore it.
-		if err == nil && imms > 0 {
-			o.InitialMmapSize = imms
-		}
-	}
-
-	return o
-}
-
-func etcdboltOptions(path string) *etcdbolt.Options {
-	o := &etcdbolt.Options{
-		Timeout:        1 * time.Second,
-		FreelistType:   etcdbolt.FreelistMapType,
-		NoFreelistSync: true,
-		MmapFlags:      getMmapFlags(path),
-	}
-
-	if os.Getenv("VAULT_RAFT_FREELIST_TYPE") == "array" {
-		o.FreelistType = etcdbolt.FreelistArrayType
-	}
-
-	if os.Getenv("VAULT_RAFT_FREELIST_SYNC") != "" {
-		o.NoFreelistSync = false
-	}
-
-	// By default, we want to set InitialMmapSize to 100GB, but only on 64bit platforms.
-	// Otherwise, we set it to whatever the value of VAULT_RAFT_INITIAL_MMAP_SIZE
-	// is, assuming it can be parsed as an int. Bolt itself sets this to 0 by default,
-	// so if users are wanting to turn this off, they can also set it to 0. Setting it
-	// to a negative value is the same as not setting it at all.
-	if os.Getenv("VAULT_RAFT_INITIAL_MMAP_SIZE") == "" {
-		o.InitialMmapSize = initialMmapSize
-	} else {
-		imms, err := strconv.Atoi(os.Getenv("VAULT_RAFT_INITIAL_MMAP_SIZE"))
-
-		// If there's an error here, it means they passed something that's not convertible to
-		// a number. Rather than fail startup, just ignore it.
-		if err == nil && imms > 0 {
-			o.InitialMmapSize = imms
-		}
-	}
-
-	return o
-}
-
 func isRaftLogVerifyCheckpoint(l *raft.Log) bool {
 	if !bytes.Equal(l.Data, []byte{byte(verifierCheckpointOp)}) {
 		return false
@@ -2385,4 +2322,25 @@ func isRaftLogVerifyCheckpoint(l *raft.Log) bool {
 
 	// Must be the last chunk of a chunked object that has chunking meta
 	return false
+}
+
+func (b *RaftBackend) ReloadConfig(config raft.ReloadableConfig) error {
+	b.l.RLock()
+	defer b.l.RUnlock()
+
+	if b.raft != nil {
+		if err := b.raft.ReloadConfig(config); err != nil {
+			return err
+		} else {
+			b.logger.Info("reloaded raft config", "settings", config)
+		}
+	}
+	return nil
+}
+
+// GetStorageConfig returns a map with the raft configuration from the storage stanza in the config file.
+func (b *RaftBackend) GetStorageConfig() map[string]string {
+	storageConfig := make(map[string]string)
+	maps.Copy(storageConfig, b.conf)
+	return storageConfig
 }
