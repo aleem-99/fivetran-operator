@@ -39,7 +39,6 @@ const (
 	ConnectorReasonFinalizerUpdateFailed           = "FinalizerUpdateFailed"
 	ConnectorReasonReconciliationFailed            = "ReconciliationFailed"
 	ConnectorReasonSuccess                         = "ReconciledSuccessfully"
-	ConnectorReasonVaultClientInitializationFailed = "VaultClientInitializationFailed"
 	ConnectorReasonVaultSecretsResolutionFailed    = "VaultSecretsResolutionFailed"
 	ConnectorReasonFivetranClientNotInitialized    = "FivetranClientNotInitialized"
 	ConnectorReasonExistingConnectorAdoptionFailed = "ExistingConnectorAdoptionFailed"

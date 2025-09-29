@@ -72,7 +72,7 @@ func (r *FivetranConnectorReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		vaultClient, err := vaultpkg.InitializeVaultClientFromSecret(ctx, r.Client, req.Namespace, vaultSecretName)
 		if err != nil {
 			err = fmt.Errorf("%w: %w", ErrVaultClientInitializationFailed, err)
-			return r.handleError(ctx, connector, conditionTypeConnectorReady, ConnectorReasonVaultClientInitializationFailed, err)
+			return ctrl.Result{}, err
 		}
 		r.VaultClient = vaultClient
 		logger.Info("vault client initialized successfully")
