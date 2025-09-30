@@ -100,7 +100,7 @@ The FivetranConnector reconciliation follows these **9 main phases**:
 - Skips work if no changes detected
 
 ### 5. **Secret Resolution**
-- Resolves any `vault://` references in connector config/auth
+- Resolves any `vault:path#key` references in connector config/auth
 - Retrieves secrets securely from Vault
 
 ### 6. **Connector Reconciliation**
