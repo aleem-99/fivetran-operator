@@ -91,9 +91,6 @@ func (r *FivetranConnectorReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return r.handleError(ctx, connector, conditionTypeConnectorReady, ConnectorReasonFinalizerUpdateFailed, err)
 	}
 
-	// Check force reconcile flag
-	forceReconcile := kubeutils.HasLabel(connector, annotationForceReconcile)
-
 	// Handle connector adoption if needed
 	needRequeue, err := r.handleExistingConnectorAdoptionIfNeeded(ctx, connector)
 	if err != nil {
@@ -102,6 +99,9 @@ func (r *FivetranConnectorReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	if needRequeue {
 		return ctrl.Result{Requeue: true}, nil
 	}
+
+	// Check force reconcile flag
+	forceReconcile := kubeutils.HasLabel(connector, annotationForceReconcile)
 
 	// Determine what needs to be reconciled
 	reconcileConnector, reconcileSchema, err := r.determineReconciliationNeeds(ctx, connector, forceReconcile)
