@@ -91,15 +91,6 @@ func (r *FivetranConnectorReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return r.handleError(ctx, connector, conditionTypeConnectorReady, ConnectorReasonFinalizerUpdateFailed, err)
 	}
 
-	// Handle connector adoption if needed
-	needRequeue, err := r.handleExistingConnectorAdoptionIfNeeded(ctx, connector)
-	if err != nil {
-		return r.handleError(ctx, connector, conditionTypeConnectorReady, ConnectorReasonExistingConnectorAdoptionFailed, err)
-	}
-	if needRequeue {
-		return ctrl.Result{Requeue: true}, nil
-	}
-
 	// Check force reconcile flag
 	forceReconcile := kubeutils.HasLabel(connector, annotationForceReconcile)
 
@@ -160,8 +151,7 @@ func (r *FivetranConnectorReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	// This is needed because ScheduleType is not available in createconnector API
 	if reconcileConnector {
 		logger.Info("Updating connector again to set ScheduleType and pause state")
-		_, err = r.updateConnector(ctx, connector, connectorID, resolvedConfig, resolvedAuth)
-		if err != nil {
+		if err := r.updateConnector(ctx, connector, connectorID, resolvedConfig, resolvedAuth); err != nil {
 			return r.handleError(ctx, connector, conditionTypeConnectorReady, ConnectorReasonReconciliationFailed, err)
 		}
 	}
