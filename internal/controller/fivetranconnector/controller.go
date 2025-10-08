@@ -25,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -38,9 +39,10 @@ import (
 // FivetranConnectorReconciler reconciles a FivetranConnector object
 type FivetranConnectorReconciler struct {
 	client.Client
-	Scheme         *runtime.Scheme
-	FivetranClient *fivetran.Client
-	VaultClient    *vaultpkg.VaultClient
+	Scheme                  *runtime.Scheme
+	FivetranClient          *fivetran.Client
+	VaultClient             *vaultpkg.VaultClient
+	MaxConcurrentReconciles int
 }
 
 // +kubebuilder:rbac:groups=operator.dataverse.redhat.com,namespace=fivetran-operator,resources=fivetranconnectors,verbs=get;list;watch;create;update;patch;delete
@@ -196,8 +198,10 @@ func (r *FivetranConnectorReconciler) handleDeletion(ctx context.Context, connec
 func (r *FivetranConnectorReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// add a predicate to the controller to reconcile only when the generation of the CR changes or the force sync label is added
 	labelPredicate := kubeutils.CustomLabelKeyChangedPredicate{LabelKey: kubeutils.ForceReconcileLabel}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&operatorv1alpha1.FivetranConnector{}).
 		WithEventFilter(predicate.Or(predicate.GenerationChangedPredicate{}, labelPredicate)).
+		WithOptions(controller.Options{MaxConcurrentReconciles: r.MaxConcurrentReconciles}).
 		Complete(r)
 }
