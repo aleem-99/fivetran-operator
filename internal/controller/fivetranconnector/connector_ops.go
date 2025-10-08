@@ -67,17 +67,14 @@ func (r *FivetranConnectorReconciler) reconcileConnector(ctx context.Context, co
 		createdNewConnector = true
 	}
 
-	// Common post-processing
 	if err := r.updateConnectorHash(ctx, connector); err != nil {
 		return "", err
 	}
 
-	// Always set condition since we performed work
 	if err := r.setCondition(ctx, connector, conditionTypeConnectorReady, metav1.ConditionTrue, ConnectorReasonSuccess, msgConnectorReady); err != nil {
 		return "", err
 	}
 
-	// Log result
 	if createdNewConnector {
 		logger.Info("Connector created successfully", "connectorId", connectorID)
 	} else {
